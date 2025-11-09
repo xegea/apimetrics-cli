@@ -1,0 +1,38 @@
+{
+  "name": "apimetrics-cli",
+  "version": "0.1.0",
+  "description": "CLI to run API load tests locally with Vegeta and upload results to Apimetrics.ai",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "apimetrics": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "execa": "^8.0.1",
+    "axios": "^1.6.2",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.10.6"
+  },
+  "keywords": [
+    "load-testing",
+    "api",
+    "vegeta",
+    "cli",
+    "performance"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/apimetrics-cli.git"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "target": "http://httpbin.org/get",
+  "method": "GET",
+  "rps": 5,
+  "duration": "10s",
+  "id": "quick-test-1"
+}

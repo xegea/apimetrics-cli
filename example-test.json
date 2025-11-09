@@ -1,0 +1,7 @@
+{
+  "target": "https://jsonplaceholder.typicode.com/posts/1",
+  "method": "GET",
+  "rps": 5,
+  "duration": "10s",
+  "id": "example-test-1"
+}
