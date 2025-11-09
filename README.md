@@ -5,11 +5,11 @@ Secure CLI to run API load tests locally with Vegeta and upload results to [Apim
 ## ⚙️ Installation
 
 ```bash
-npm install -g apimetrics-cli
+npm install -g @xegea/apimetrics-cli --registry=https://npm.pkg.github.com/
 
 # or
 
-npx apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
+npx @xegea/apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
 ```
 
 ## 🧩 Example test definition
@@ -43,7 +43,7 @@ Create a JSON file (e.g., `test.json`) with your request configuration:
 apimetrics run ./test.json --token=YOUR_JWT_TOKEN
 
 # Or using npx
-npx apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
+npx @xegea/apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
 ```
 
 ### Environment Configuration
