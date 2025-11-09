@@ -4,17 +4,69 @@ Secure CLI to run API load tests locally with Vegeta and upload results to [Apim
 
 ## ⚙️ Installation
 
+### **Step 1: Install the CLI**
 ```bash
-npm install -g @xegea/apimetrics-cli --registry=https://npm.pkg.github.com/
-
-# or
-
-npx @xegea/apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
+npm install -g @xegea/apimetrics-cli
 ```
 
-## 🧩 Example test definition
+### **Step 2: Restart your terminal**
+After installation, restart your terminal or run:
+```bash
+source ~/.zshrc  # (or ~/.bashrc if using bash)
+```
 
-Create a JSON file (e.g., `test.json`) with your request configuration:
+### **Step 3: Verify installation**
+```bash
+apimetrics --help
+```
+
+## 🧩 Quick Start
+
+### **Step 4: Create a test configuration**
+Create a file called `test.json`:
+```json
+{
+  "target": "https://httpbin.org/get",
+  "method": "GET",
+  "rps": 5,
+  "duration": "10s",
+  "id": "my-first-test"
+}
+```
+
+### **Step 5: Run your first load test**
+```bash
+apimetrics run test.json --token YOUR_JWT_TOKEN
+```
+
+## 📋 Complete Example
+
+```bash
+# 1. Install
+npm install -g @xegea/apimetrics-cli
+
+# 2. Restart terminal
+source ~/.zshrc
+
+# 3. Verify
+apimetrics --help
+
+# 4. Create test.json
+# {
+#   "target": "https://your-api.com/endpoint",
+#   "method": "GET",
+#   "rps": 10,
+#   "duration": "30s",
+#   "id": "my-test"
+# }
+
+# 5. Run test
+apimetrics run test.json --token YOUR_JWT_TOKEN --env dev
+```
+
+## 🧩 Test Configuration
+
+Create a JSON file with your request configuration:
 
 ```json
 {
@@ -42,7 +94,16 @@ Create a JSON file (e.g., `test.json`) with your request configuration:
 # Run a load test and upload results
 apimetrics run ./test.json --token=YOUR_JWT_TOKEN
 
-# Or using npx
+# Run against dev environment
+apimetrics run ./test.json --token=YOUR_JWT_TOKEN --env dev
+
+# Run against production
+apimetrics run ./test.json --token=YOUR_JWT_TOKEN --env prod
+```
+
+### Alternative: Using npx
+
+```bash
 npx @xegea/apimetrics-cli run ./test.json --token=YOUR_JWT_TOKEN
 ```
 
@@ -117,7 +178,33 @@ npm run build
 npm start run test.json --key=abc123
 ```
 
-## 📦 Publishing
+## � Troubleshooting
+
+### Command not found after installation
+If `apimetrics` command isn't found:
+1. **Restart your terminal** (close and reopen)
+2. **Or reload your shell config:**
+   ```bash
+   source ~/.zshrc  # (or ~/.bashrc)
+   ```
+3. **Check if npm bin directory is in PATH:**
+   ```bash
+   npm config get prefix
+   echo $PATH | grep -o '/.*/bin'
+   ```
+
+### Permission issues
+If you get permission errors during installation:
+```bash
+# Try with sudo (not recommended)
+sudo npm install -g @xegea/apimetrics-cli
+
+# Or fix npm permissions
+npm config set prefix ~/.npm
+export PATH="$HOME/.npm/bin:$PATH"
+```
+
+## �📦 Publishing
 
 The project is configured to automatically publish to npm when a GitHub release is created. See `.github/workflows/publish.yml` for details.
 
