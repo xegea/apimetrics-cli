@@ -28,7 +28,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       apiUrl = options.apiUrl;
     } else {
       // Determine based on environment
-      const env = options.env || process.env.NODE_ENV || 'local';
+      const env = options.env || process.env.NODE_ENV || 'prod';
       
       const envApiUrls = {
         local: 'http://localhost:3000',
@@ -42,7 +42,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
     }
 
     console.log(chalk.cyan(`🌐 API URL: ${apiUrl}`));
-    console.log(chalk.gray(`📍 Environment: ${options.env || process.env.NODE_ENV || 'local'}`));
+    console.log(chalk.gray(`📍 Environment: ${options.env || process.env.NODE_ENV || 'prod'}`));
 
     const config: Config = JSON.parse(await fs.readFile(definitionPath, "utf8"));
     validateConfig(config);

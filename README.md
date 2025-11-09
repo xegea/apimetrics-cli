@@ -91,14 +91,14 @@ Create a JSON file with your request configuration:
 ### Basic Usage
 
 ```bash
-# Run a load test and upload results
-apimetrics run ./test.json --token=YOUR_JWT_TOKEN
+# Run a load test and upload results (defaults to prod environment)
+apimetrics run ./test.json --token YOUR_JWT_TOKEN
 
 # Run against dev environment
-apimetrics run ./test.json --token=YOUR_JWT_TOKEN --env dev
+apimetrics run ./test.json --token YOUR_JWT_TOKEN --env dev
 
-# Run against production
-apimetrics run ./test.json --token=YOUR_JWT_TOKEN --env prod
+# Run against local environment
+apimetrics run ./test.json --token YOUR_JWT_TOKEN --env local
 ```
 
 ### Alternative: Using npx
@@ -113,9 +113,9 @@ The CLI automatically determines the API endpoint based on the environment:
 
 | Environment | API URL |
 |-------------|---------|
-| `local` (default) | `http://localhost:3000` |
+| `prod` / `production` (default) | `https://apimetrics.onrender.com` |
 | `dev` / `development` | `https://apimetrics.onrender.com` |
-| `prod` / `production` | `https://apimetrics.onrender.com` |
+| `local` | `http://localhost:3000` |
 
 You can control the environment in these ways:
 
