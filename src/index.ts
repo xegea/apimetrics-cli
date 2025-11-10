@@ -2,6 +2,15 @@
 
 import { Command } from "commander";
 import { runCommand } from "./commands/run.js";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+// Get version from package.json
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf8"));
+const version = packageJson.version;
 
 // Determine default API URL based on environment
 function getDefaultApiUrl(): string {
@@ -31,7 +40,7 @@ const program = new Command();
 program
   .name("apimetrics")
   .description("Run and upload API load tests using Vegeta")
-  .version("0.1.0");
+  .version(version);
 
 program
   .command("run <definition>")
