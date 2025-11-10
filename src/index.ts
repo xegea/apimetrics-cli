@@ -9,8 +9,14 @@ import { dirname, join } from "path";
 // Get version from package.json
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf8"));
-const version = packageJson.version;
+let version = "0.2.5"; // fallback version
+try {
+  const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf8"));
+  version = packageJson.version;
+} catch (error) {
+  // If package.json not found, use fallback version
+  console.warn("Could not read package.json, using fallback version:", version);
+}
 
 // Determine default API URL based on environment
 function getDefaultApiUrl(): string {
