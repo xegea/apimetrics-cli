@@ -97,6 +97,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       throw error;
     }
 
+
     console.log(chalk.blue("📊 Sending results..."));
 
       // Upload results to Apimetrics backend
@@ -111,7 +112,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
         const response = await axios.post(
           `${apiUrl}/results`,
           {
-            id: config.id,
+            executionId: config.id,
             avgLatency: results.avgLatency,
             p95Latency: results.p95Latency,
             successRate: results.successRate,
