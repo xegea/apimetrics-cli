@@ -85,12 +85,16 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       const successRate = successRequests / totalRequests;
       
       // Prepare results
+      // Note: Vegeta already returns latencies in nanoseconds, so no conversion needed
       results = {
-        avgLatency: Math.round((latencies.mean || 0) * 1000000), // Convert to nanoseconds
-        p95Latency: Math.round((latencies["95p"] || latencies.mean || 0) * 1000000),
+        avgLatency: Math.round(latencies.mean || 0),
+        p95Latency: Math.round(latencies["95p"] || latencies.mean || 0),
         successRate: successRate,
         timestamp: new Date().toISOString(),
       };
+
+      console.log(chalk.gray(`Raw latency from Vegeta: mean=${latencies.mean}ns`));
+      console.log(chalk.gray(`Results to send: avgLatency=${results.avgLatency}ns, p95Latency=${results.p95Latency}ns`));
 
     } catch (error) {
       console.error(chalk.red("❌ Load test failed:"), error instanceof Error ? error.message : String(error));
@@ -112,7 +116,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
         const response = await axios.post(
           `${apiUrl}/results`,
           {
-            executionId: config.id,
+            executionId: config.id.replace(/-\d+$/, ''), // Remove trailing -{number} suffix
             avgLatency: results.avgLatency,
             p95Latency: results.p95Latency,
             successRate: results.successRate,
