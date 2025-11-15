@@ -117,7 +117,7 @@ export async function executeCommand(options: RunOptions): Promise<void> {
         headers: {
           Authorization: `Bearer ${token}`,
         },
-        timeout: 5000,
+        timeout: 30000, // Increased from 5000ms to 30000ms (30 seconds)
       }
     );
 

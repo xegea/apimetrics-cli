@@ -52,7 +52,24 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
     // Run Vegeta load test
     const attackInput = `${config.method.toUpperCase()} ${config.target}\n`;
     
-    let results: { avgLatency: number; p95Latency: number; successRate: number; timestamp: string };
+    let results: { 
+      avgLatency: number; 
+      p95Latency: number; 
+      successRate: number; 
+      timestamp: string;
+      minLatency?: number;
+      maxLatency?: number;
+      p50Latency?: number;
+      p99Latency?: number;
+      totalRequests?: number;
+      testDuration?: string;
+      actualRate?: number;
+      throughput?: number;
+      bytesIn?: number;
+      bytesOut?: number;
+      statusCodes?: Record<string, number>;
+      errors?: string[];
+    };
     
     try {
       // Run vegeta attack and pipe to vegeta report
@@ -76,6 +93,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       // Extract metrics
       const latencies = report.latencies || {};
       const statusCodes = report.status_codes || {};
+      const errors = report.errors || [];
       
       // Calculate success rate
       const totalRequests = report.requests || 1;
@@ -88,9 +106,22 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       // Note: Vegeta already returns latencies in nanoseconds, so no conversion needed
       results = {
         avgLatency: Math.round(latencies.mean || 0),
-        p95Latency: Math.round(latencies["95p"] || latencies.mean || 0),
+        p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
         successRate: successRate,
         timestamp: new Date().toISOString(),
+        // Comprehensive metrics
+        minLatency: Math.round(latencies.min || 0),
+        maxLatency: Math.round(latencies.max || 0),
+        p50Latency: Math.round(latencies["50th"] || 0),
+        p99Latency: Math.round(latencies["99th"] || 0),
+        totalRequests: report.requests,
+        testDuration: typeof report.duration === 'string' ? report.duration : `${(Number(report.duration) / 1000000000).toFixed(2)}s`,
+        actualRate: report.rate,
+        throughput: report.throughput,
+        bytesIn: report.bytes_in?.total,
+        bytesOut: report.bytes_out?.total,
+        statusCodes: statusCodes,
+        errors: errors,
       };
 
       console.log(chalk.gray(`Raw latency from Vegeta: mean=${latencies.mean}ns`));
@@ -121,10 +152,23 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
             p95Latency: results.p95Latency,
             successRate: results.successRate,
             timestamp: results.timestamp,
+            // Comprehensive metrics
+            minLatency: results.minLatency,
+            maxLatency: results.maxLatency,
+            p50Latency: results.p50Latency,
+            p99Latency: results.p99Latency,
+            totalRequests: results.totalRequests,
+            testDuration: results.testDuration,
+            actualRate: results.actualRate,
+            throughput: results.throughput,
+            bytesIn: results.bytesIn,
+            bytesOut: results.bytesOut,
+            statusCodes: results.statusCodes,
+            errors: results.errors,
           },
           {
             headers,
-            timeout: 5000,
+            timeout: 30000, // Increased from 5000ms to 30000ms (30 seconds)
           }
         );
 
@@ -142,6 +186,6 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
         } else {
           console.error(chalk.red("❌ Upload Error:"), uploadErr instanceof Error ? uploadErr.message : String(uploadErr));
         }
-        throw uploadErr;
+        // Don't re-throw - allow the command to complete even if upload fails
       }
     }

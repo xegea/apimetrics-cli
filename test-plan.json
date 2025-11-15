@@ -1,0 +1,31 @@
+{
+  "metadata": {
+    "name": "Quick Test Plan",
+    "planName": "Quick Test Plan",
+    "createdAt": "2025-11-15T18:00:00Z"
+  },
+  "authentication": {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ0ZXN0LXVzZXItMTIzIiwiZW1haWwiOiJ0ZXN0QGV4YW1wbGUuY29tIiwiaWF0IjoxNzYzMjMwNzA2LCJleHAiOjE3NjM4MzU1MDZ9.STeNrKlz6eTiYF19DzQNabckErFxOb6nHko3o4LuKAw",
+    "tokenType": "Bearer"
+  },
+  "tests": [
+    {
+      "id": "test-1",
+      "name": "Test 1 - Simple GET",
+      "method": "GET",
+      "target": "https://jsonplaceholder.typicode.com/posts/1",
+      "rps": 3,
+      "duration": "5s",
+      "description": "Quick test of simple endpoint"
+    },
+    {
+      "id": "test-2", 
+      "name": "Test 2 - Another GET",
+      "method": "GET",
+      "target": "https://jsonplaceholder.typicode.com/posts/2",
+      "rps": 3,
+      "duration": "5s",
+      "description": "Another quick test"
+    }
+  ]
+}
