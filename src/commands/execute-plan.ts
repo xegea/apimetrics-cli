@@ -19,10 +19,18 @@ interface ExecutionPlanFile {
   tests: Array<{
     id: string;
     name: string;
-    method: string;
-    target: string;
+    requests?: Array<{
+      method: string;
+      target: string;
+      description?: string;
+    }>;
+    // Legacy fields for backward compatibility
+    method?: string;
+    target?: string;
     rps: number;
     duration: string;
+    iterations?: number;
+    delayBetweenRequests?: string;
     description?: string;
   }>;
   instructions?: {
@@ -128,12 +136,34 @@ async function runTest(
   total: number
 ): Promise<void> {
   console.log(chalk.blue(`\n[${index}/${total}] ${test.name}`));
-  console.log(chalk.gray(`  ${test.method} ${test.target}`));
-  console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
-  console.log(chalk.gray(`  Description: ${test.description || 'N/A'}`));
+  
+  let attackInput = '';
+  let requestCount = 0;
+  
+  if (test.requests && test.requests.length > 0) {
+    // New format: cycle through all requests
+    console.log(chalk.gray(`  Cycling through ${test.requests.length} request(s) in order`));
+    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
+    
+    // Generate attack input with all requests in order - Vegeta will cycle through them
+    for (const request of test.requests) {
+      attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+      requestCount++;
+    }
+  } else if (test.method && test.target) {
+    // Legacy format: single request
+    console.log(chalk.gray(`  ${test.method} ${test.target}`));
+    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
+    console.log(chalk.gray(`  Description: ${test.description || 'N/A'}`));
+    
+    attackInput = `${test.method.toUpperCase()} ${test.target}\n`;
+    requestCount = 1;
+  } else {
+    throw new Error('Test must have either requests array or method/target');
+  }
+  
+  console.log(chalk.gray(`  Total requests in sequence: ${requestCount}`));
   console.log("");
-
-  const attackInput = `${test.method.toUpperCase()} ${test.target}\n`;
 
   try {
     // Run vegeta attack and pipe to vegeta report
