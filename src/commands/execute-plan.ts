@@ -234,9 +234,9 @@ async function ensureVegeta(): Promise<void> {
     let vegetaUrl: string;
     if (platform === 'darwin') {
       if (arch === 'arm64') {
-        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/latest/download/vegeta-12.3.0-darwin-arm64.tar.gz';
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_arm64.tar.gz';
       } else {
-        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/latest/download/vegeta-12.3.0-darwin-amd64.tar.gz';
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_amd64.tar.gz';
       }
     } else {
       throw new Error(`Unsupported platform: ${platform} ${arch}`);
@@ -252,18 +252,9 @@ async function ensureVegeta(): Promise<void> {
       console.log(chalk.gray(`  Downloading from: ${vegetaUrl}`));
       
       // Use curl with better options
-      try {
-        await execa('curl', ['-L', '-f', '-o', tarballPath, vegetaUrl], {
-          timeout: 60000 // 1 minute timeout
-        });
-      } catch (curlError) {
-        // Try alternative URL format
-        const altUrl = vegetaUrl.replace('/latest/download/', '/download/');
-        console.log(chalk.gray(`  Trying alternative URL: ${altUrl}`));
-        await execa('curl', ['-L', '-f', '-o', tarballPath, altUrl], {
-          timeout: 60000
-        });
-      }
+      await execa('curl', ['-L', '-f', '-o', tarballPath, vegetaUrl], {
+        timeout: 60000 // 1 minute timeout
+      });
 
       // Verify the file was downloaded
       const stats = await fs.stat(tarballPath);
