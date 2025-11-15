@@ -145,190 +145,136 @@ async function runTest(
   total: number
 ): Promise<boolean> {
   console.log(chalk.blue(`\n[${index}/${total}] ${test.name}`));
-
-  let requests: Array<{ method: string; target: string; description?: string }> = [];
-
+  
+  let attackInput = '';
+  let requestCount = 0;
+  
   if (test.requests && test.requests.length > 0) {
-    // New format: multiple requests
-    requests = test.requests;
-    console.log(chalk.gray(`  Testing ${test.requests.length} request(s) individually`));
+    // New format: cycle through all requests
+    console.log(chalk.gray(`  Cycling through ${test.requests.length} request(s) in order`));
+    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
+    
+    // Generate attack input with all requests in order - Vegeta will cycle through them
+    for (const request of test.requests) {
+      attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+      requestCount++;
+    }
   } else if (test.method && test.target) {
     // Legacy format: single request
-    requests = [{ method: test.method, target: test.target, description: test.description }];
+    console.log(chalk.gray(`  ${test.method} ${test.target}`));
+    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
+    console.log(chalk.gray(`  Description: ${test.description || 'N/A'}`));
+    
+    attackInput = `${test.method.toUpperCase()} ${test.target}\n`;
+    requestCount = 1;
   } else {
     throw new Error('Test must have either requests array or method/target');
   }
-
-  console.log(chalk.gray(`  RPS per request: ${test.rps}, Duration: ${test.duration}`));
+  
+  console.log(chalk.gray(`  Total requests in sequence: ${requestCount}`));
   console.log("");
 
-  const perRequestResults: Array<{
-    requestIndex: number;
-    endpoint: string;
-    httpMethod: string;
-    report: any;
-  }> = [];
+  // Run vegeta attack and pipe to vegeta report
+  const { stdout } = await execa(
+      'sh',
+      ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${test.rps} -duration=${test.duration} | vegeta report -type=json`],
+      {
+        stripFinalNewline: true,
+        timeout: 300000 // 5 minutes timeout for the test
+      }
+    );
 
-  // Run each request individually
-  for (let i = 0; i < requests.length; i++) {
-    const request = requests[i];
-    console.log(chalk.cyan(`    Request ${i + 1}/${requests.length}: ${request.method} ${request.target}`));
+    // Parse the JSON output
+    const report = JSON.parse(stdout);
 
-    try {
-      const attackInput = `${request.method.toUpperCase()} ${request.target}\n`;
+    console.log(chalk.green(`  ✅ Load test completed`));
+    console.log(chalk.gray(`     Requests: ${report.requests || 0}`));
+    console.log(chalk.gray(`     Duration: ${report.duration || 'N/A'}`));
+    console.log(chalk.gray(`     Rate: ${report.rate || 'N/A'} RPS`));
+    console.log(chalk.gray(`     Throughput: ${report.throughput || 'N/A'} req/sec`));
+    console.log(chalk.gray(`     Success Rate: ${(report.success * 100 || 0).toFixed(2)}%`));
 
-      // Run vegeta attack for this specific request
-      const { stdout } = await execa(
-        'sh',
-        ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${test.rps} -duration=${test.duration} | vegeta report -type=json`],
-        {
-          stripFinalNewline: true,
-          timeout: 300000 // 5 minutes timeout for the test
-        }
-      );
+    // Extract detailed metrics
+    const latencies = report.latencies || {};
+    const statusCodes = report.status_codes || {};
+    const errors = report.errors || [];
 
-      const report = JSON.parse(stdout);
-      perRequestResults.push({
-        requestIndex: i,
-        endpoint: request.target,
-        httpMethod: request.method.toUpperCase(),
-        report
+    console.log(chalk.cyan(`\n     📊 Detailed Metrics:`));
+    
+    // Latency metrics
+    console.log(chalk.gray(`     Response Times:`));
+    console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • Min:  ${(latencies.min / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • Max:  ${(latencies.max / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P50:  ${(latencies["50th"] / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P95:  ${(latencies["95th"] / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P99:  ${(latencies["99th"] / 1000000 || 0).toFixed(2)}ms`));
+
+    // Data transfer
+    if (report.bytes_in || report.bytes_out) {
+      console.log(chalk.gray(`     Data Transfer:`));
+      if (report.bytes_in) {
+        console.log(chalk.gray(`       • Bytes In:  ${report.bytes_in.total || 0} total, ${(report.bytes_in.mean || 0).toFixed(0)} avg`));
+      }
+      if (report.bytes_out) {
+        console.log(chalk.gray(`       • Bytes Out: ${report.bytes_out.total || 0} total, ${(report.bytes_out.mean || 0).toFixed(0)} avg`));
+      }
+    }
+
+    // Status codes breakdown
+    if (Object.keys(statusCodes).length > 0) {
+      console.log(chalk.gray(`     Status Codes:`));
+      Object.entries(statusCodes).forEach(([code, count]) => {
+        const statusColor = parseInt(code) >= 200 && parseInt(code) < 300 ? chalk.green :
+                           parseInt(code) >= 400 && parseInt(code) < 500 ? chalk.yellow :
+                           parseInt(code) >= 500 ? chalk.red : chalk.gray;
+        console.log(statusColor(`       • ${code}: ${count}`));
       });
-
-      console.log(chalk.green(`      ✅ Completed`));
-      console.log(chalk.gray(`         Requests: ${report.requests || 0}`));
-      console.log(chalk.gray(`         Throughput: ${report.throughput || 'N/A'} req/sec`));
-      console.log(chalk.gray(`         Success Rate: ${(report.success * 100 || 0).toFixed(2)}%`));
-
-    } catch (error) {
-      console.error(chalk.red(`      ❌ Failed: ${error instanceof Error ? error.message : String(error)}`));
-      // Continue with other requests
     }
-  }
 
-  // Aggregate results for overall test metrics
-  if (perRequestResults.length === 0) {
-    console.error(chalk.red(`  ❌ No requests completed successfully`));
-    return false;
-  }
-
-  // Calculate overall metrics
-  const totalRequests = perRequestResults.reduce((sum, r) => sum + (r.report.requests || 0), 0);
-  const totalSuccess = perRequestResults.reduce((sum, r) => sum + ((r.report.requests || 0) * (r.report.success || 0)), 0);
-  const overallSuccessRate = totalRequests > 0 ? totalSuccess / totalRequests : 0;
-
-  // Use the first request's latencies as overall (or could calculate weighted average)
-  const firstReport = perRequestResults[0].report;
-  const latencies = firstReport.latencies || {};
-  const statusCodes = firstReport.status_codes || {};
-  const errors = firstReport.errors || [];
-
-  console.log(chalk.green(`  ✅ Load test completed`));
-  console.log(chalk.gray(`     Total Requests: ${totalRequests}`));
-  console.log(chalk.gray(`     Overall Success Rate: ${(overallSuccessRate * 100).toFixed(2)}%`));
-
-  // Extract detailed metrics from first request (for backwards compatibility)
-  console.log(chalk.cyan(`\n     📊 Detailed Metrics (from first request):`));
-
-  // Latency metrics
-  console.log(chalk.gray(`     Response Times:`));
-  console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
-  console.log(chalk.gray(`       • Min:  ${(latencies.min / 1000000 || 0).toFixed(2)}ms`));
-  console.log(chalk.gray(`       • Max:  ${(latencies.max / 1000000 || 0).toFixed(2)}ms`));
-  console.log(chalk.gray(`       • P50:  ${(latencies["50th"] / 1000000 || 0).toFixed(2)}ms`));
-  console.log(chalk.gray(`       • P95:  ${(latencies["95th"] / 1000000 || 0).toFixed(2)}ms`));
-  console.log(chalk.gray(`       • P99:  ${(latencies["99th"] / 1000000 || 0).toFixed(2)}ms`));
-
-  // Data transfer
-  if (firstReport.bytes_in || firstReport.bytes_out) {
-    console.log(chalk.gray(`     Data Transfer:`));
-    if (firstReport.bytes_in) {
-      console.log(chalk.gray(`       • Bytes In:  ${firstReport.bytes_in.total || 0} total, ${(firstReport.bytes_in.mean || 0).toFixed(0)} avg`));
+    // Errors
+    if (errors.length > 0) {
+      console.log(chalk.red(`     Errors (${errors.length}):`));
+      errors.slice(0, 5).forEach((error: string) => {
+        console.log(chalk.red(`       • ${error}`));
+      });
+      if (errors.length > 5) {
+        console.log(chalk.red(`       • ... and ${errors.length - 5} more`));
+      }
     }
-    if (firstReport.bytes_out) {
-      console.log(chalk.gray(`       • Bytes Out: ${firstReport.bytes_out.total || 0} total, ${(firstReport.bytes_out.mean || 0).toFixed(0)} avg`));
-    }
-  }
 
-  // Status codes breakdown
-  if (Object.keys(statusCodes).length > 0) {
-    console.log(chalk.gray(`     Status Codes:`));
-    Object.entries(statusCodes).forEach(([code, count]) => {
-      const statusColor = parseInt(code) >= 200 && parseInt(code) < 300 ? chalk.green :
-                         parseInt(code) >= 400 && parseInt(code) < 500 ? chalk.yellow :
-                         parseInt(code) >= 500 ? chalk.red : chalk.gray;
-      console.log(statusColor(`       • ${code}: ${count}`));
-    });
-  }
+    // Calculate success rate for upload
+    const totalRequests = report.requests || 1;
+    const successRequests = Object.entries(statusCodes)
+      .filter(([code]) => parseInt(code) >= 200 && parseInt(code) < 300)
+      .reduce((sum, [, count]) => sum + (count as number), 0);
+    const successRate = successRequests / totalRequests;
 
-  // Errors
-  if (errors.length > 0) {
-    console.log(chalk.red(`     Errors (${errors.length}):`));
-    errors.slice(0, 5).forEach((error: string) => {
-      console.log(chalk.red(`       • ${error}`));
-    });
-    if (errors.length > 5) {
-      console.log(chalk.red(`       • ... and ${errors.length - 5} more`));
-    }
-  }
+    // Prepare results for upload
+    const results = {
+      executionId: test.id,
+      avgLatency: Math.round(latencies.mean || 0),
+      p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
+      successRate: successRate,
+      timestamp: new Date().toISOString(),
+      // Detailed metrics
+      minLatency: Math.round(latencies.min || 0),
+      maxLatency: Math.round(latencies.max || 0),
+      p50Latency: Math.round(latencies["50th"] || 0),
+      p99Latency: Math.round(latencies["99th"] || 0),
+      requests: report.requests,
+      duration: typeof report.duration === 'string' ? report.duration : `${(Number(report.duration) / 1000000000).toFixed(2)}s`,
+      rate: report.rate,
+      throughput: report.throughput,
+      bytesIn: report.bytes_in?.total,
+      bytesOut: report.bytes_out?.total,
+      statusCodes: statusCodes,
+      errors: errors,
+    };
 
-  // Calculate success rate for upload
-  const totalReqs = firstReport.requests || 1;
-  const successRequests = Object.entries(statusCodes)
-    .filter(([code]) => parseInt(code) >= 200 && parseInt(code) < 300)
-    .reduce((sum, [, count]) => sum + (count as number), 0);
-  const successRate = successRequests / totalReqs;
-
-  // Prepare results for upload
-  const results = {
-    executionId: test.id,
-    avgLatency: Math.round(latencies.mean || 0),
-    p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
-    successRate: successRate,
-    timestamp: new Date().toISOString(),
-    // Detailed metrics
-    minLatency: Math.round(latencies.min || 0),
-    maxLatency: Math.round(latencies.max || 0),
-    p50Latency: Math.round(latencies["50th"] || 0),
-    p99Latency: Math.round(latencies["99th"] || 0),
-    requests: firstReport.requests,
-    duration: typeof firstReport.duration === 'string' ? firstReport.duration : `${(Number(firstReport.duration) / 1000000000).toFixed(2)}s`,
-    rate: firstReport.rate,
-    throughput: firstReport.throughput,
-    bytesIn: firstReport.bytes_in?.total,
-    bytesOut: firstReport.bytes_out?.total,
-    statusCodes: statusCodes,
-    errors: errors,
-    // Add per-request results
-    perRequestResults: perRequestResults.map(r => ({
-      requestIndex: r.requestIndex,
-      endpoint: r.endpoint,
-      httpMethod: r.httpMethod,
-      avgLatency: Math.round(r.report.latencies?.mean || 0),
-      p95Latency: Math.round(r.report.latencies?.["95th"] || r.report.latencies?.mean || 0),
-      successRate: r.report.success || 0,
-      minLatency: Math.round(r.report.latencies?.min || 0),
-      maxLatency: Math.round(r.report.latencies?.max || 0),
-      p50Latency: Math.round(r.report.latencies?.["50th"] || 0),
-      p99Latency: Math.round(r.report.latencies?.["99th"] || 0),
-      requests: r.report.requests,
-      throughput: r.report.throughput,
-      bytesIn: r.report.bytes_in?.total,
-      bytesOut: r.report.bytes_out?.total,
-      statusCodes: r.report.status_codes,
-      errors: r.report.errors,
-    }))
-  };
-
-  // Upload results
-  const uploadSuccess = await uploadResults(results, token, apiUrl, test.name);
-  return uploadSuccess;
-
-  } catch (error) {
-    console.error(chalk.red(`  ❌ Test failed:`), error instanceof Error ? error.message : String(error));
-    // Continue with next test instead of failing completely
-    return false;
-  }
+    // Upload results
+    const uploadSuccess = await uploadResults(results, token, apiUrl, test.name);
+    return uploadSuccess;
 }
 
 async function uploadResults(
