@@ -2,6 +2,8 @@
 
 import { Command } from "commander";
 import { runCommand } from "./commands/run.js";
+import { executeCommand } from "./commands/execute.js";
+import { executePlanCommand } from "./commands/execute-plan.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -55,5 +57,12 @@ program
   .option("--api-url <url>", "API endpoint URL (overrides environment-based defaults)")
   .option("--env <environment>", "Environment (local, dev, prod) - overrides NODE_ENV")
   .action(runCommand);
+
+program
+  .command("execute-plan <planFile>")
+  .description("Execute a load test plan from a JSON file (downloaded from dashboard)")
+  .option("--api-url <url>", "API endpoint URL (overrides environment-based defaults)")
+  .option("--env <environment>", "Environment (local, dev, prod) - overrides NODE_ENV")
+  .action(executePlanCommand);
 
 program.parse();
