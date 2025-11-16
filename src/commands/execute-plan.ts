@@ -10,6 +10,7 @@ interface ExecutionPlanFile {
     planName: string;
     createdAt: string;
     description?: string;
+    executionId?: string; // The LoadTestExecution ID to add results to
   };
   authentication: {
     token: string;
@@ -50,6 +51,42 @@ interface LoadTestExecution {
   name: string;
   status: string;
   executionPlanId: string;
+}
+
+interface ExecutionPlan {
+  id: string;
+  name: string;
+  executionTime?: string;
+  delayBetweenRequests?: string;
+  iterations?: number;
+}
+
+async function createOrGetExecutionPlan(
+  plan: ExecutionPlanFile,
+  token: string,
+  apiUrl: string
+): Promise<ExecutionPlan | null> {
+  try {
+    const response = await axios.post(
+      `${apiUrl}/loadtestsplans`,
+      {
+        name: plan.metadata.planName,
+        executionTime: plan.tests[0]?.duration || '1m',
+        delayBetweenRequests: plan.tests[0]?.delayBetweenRequests || '100ms',
+        iterations: plan.tests[0]?.iterations || 1,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 10000,
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error(chalk.red('Failed to create/get execution plan:'), error instanceof Error ? error.message : String(error));
+    return null;
+  }
 }
 
 async function createLoadTestExecution(
@@ -144,35 +181,19 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
     // Check if Vegeta is available, download if not
     await ensureVegeta();
 
-    // Run all tests in a single load test execution
-    console.log(chalk.cyan(`\n🚀 Starting combined load test with ${plan.tests.length} test(s)...\n`));
-
-    // Create a new load test execution first
-    const executionPlanId = plan.tests[0].id; // This is the execution plan ID
-    const executionName = `${plan.metadata.planName} - ${new Date().toLocaleString('en-US', { 
-      year: 'numeric', 
-      month: '2-digit', 
-      day: '2-digit', 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      second: '2-digit',
-      hour12: false 
-    }).replace(',', '')}`;
-    
-    const newExecution = await createLoadTestExecution(executionPlanId, executionName, token, apiUrl);
-    
-    if (!newExecution) {
-      console.log(chalk.red(`\n❌ Failed to create load test execution. Aborting.`));
-      return;
+    // Get the LoadTestExecution ID from the execution plan file
+    const executionId = plan.metadata.executionId;
+    if (!executionId) {
+      throw new Error("No execution ID found in execution plan file. Please download a fresh execution plan from the dashboard.");
     }
 
-    console.log(chalk.green(`✅ Created new load test execution: ${newExecution.id}`));
+    console.log(chalk.cyan(`\n🚀 Starting load tests for execution: ${executionId}\n`));
 
-    const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, newExecution.id);
+    const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, executionId);
 
     if (uploadSuccess) {
       console.log(chalk.green(`\n🎉 Load test completed!`));
-      console.log(chalk.green(`📊 Results have been uploaded to your ApiMetrics dashboard`));
+      console.log(chalk.green(`📊 Results have been added to your execution`));
       console.log(chalk.green(`🌐 View results at: https://apimetrics.ai`));
     } else {
       console.log(chalk.yellow(`\n⚠️  Test result failed to upload. Please check the errors above.`));
@@ -334,9 +355,10 @@ async function runCombinedTests(
     console.log(chalk.gray(`  timestamp: ${results.timestamp}`));
     console.log(chalk.gray(`  requests: ${results.requests} (type: ${typeof results.requests})`));
 
-    // Upload results
-    const uploadSuccess = await uploadResults(results, token, apiUrl, planName);
-    return uploadSuccess;
+    // Create test result in the execution
+    const testId = tests[0].id || 'default-test';
+    const resultCreated = await createTestResult(executionId, testId, results, token, apiUrl);
+    return resultCreated;
 }
 
 async function runTest(
@@ -477,6 +499,64 @@ async function runTest(
     // Upload results
     const uploadSuccess = await uploadResults(results, token, apiUrl, test.name);
     return uploadSuccess;
+}
+
+async function createTestResult(
+  executionId: string,
+  testId: string,
+  results: any,
+  token: string,
+  apiUrl: string
+): Promise<boolean> {
+  try {
+    console.log(chalk.cyan('\n📤 Creating test result...'));
+    
+    const resultData = {
+      testId: testId,
+      avgLatency: results.avgLatency,
+      p95Latency: results.p95Latency,
+      successRate: results.successRate,
+      timestamp: results.timestamp,
+      minLatency: results.minLatency,
+      maxLatency: results.maxLatency,
+      p50Latency: results.p50Latency,
+      p99Latency: results.p99Latency,
+      totalRequests: results.requests,
+      testDuration: results.duration,
+      actualRate: results.rate,
+      throughput: results.throughput,
+      bytesIn: results.bytesIn,
+      bytesOut: results.bytesOut,
+      statusCodes: JSON.stringify(results.statusCodes || {}),
+      errorDetails: JSON.stringify(results.errors || []),
+    };
+    
+    const response = await axios.post(
+      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
+      resultData,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 10000,
+      }
+    );
+
+    console.log(chalk.green(`  ✅ Test result created successfully`));
+    console.log(chalk.gray(`  Response: ${response.status} ${response.statusText}`));
+    return true;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      console.error(chalk.red(`  ⚠️  Result creation error:`), error.message);
+      if (error.response) {
+        console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
+        console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
+      }
+    } else {
+      console.error(chalk.red(`  ⚠️  Unexpected error:`, error instanceof Error ? error.message : String(error)));
+    }
+    return false;
+  }
 }
 
 async function uploadResults(
