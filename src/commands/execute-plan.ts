@@ -60,7 +60,7 @@ async function createLoadTestExecution(
 ): Promise<LoadTestExecution | null> {
   try {
     const response = await axios.post(
-      `${apiUrl}/loadtestexecutions`,
+      `${apiUrl}/loadtestsexecutions`,
       {
         executionPlanId,
         name,
