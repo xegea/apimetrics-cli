@@ -24,6 +24,8 @@ interface ExecutionPlanFile {
       method: string;
       target: string;
       description?: string;
+      headers?: Record<string, string>;
+      body?: string;
     }>;
     // Legacy fields for backward compatibility
     method?: string;
@@ -223,7 +225,17 @@ async function runCombinedTests(
     if (test.requests && test.requests.length > 0) {
       console.log(chalk.gray(`  • ${test.name}: ${test.requests.length} request(s)`));
       for (const request of test.requests) {
-        attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+        let target = `${request.method.toUpperCase()} ${request.target}\n`;
+        if (request.headers) {
+          for (const [key, value] of Object.entries(request.headers)) {
+            target += `${key}: ${value}\n`;
+          }
+        }
+        target += '\n'; // Empty line to separate headers from body
+        if (request.body) {
+          target += request.body + '\n';
+        }
+        attackInput += target;
         totalRequestCount++;
       }
     } else if (test.method && test.target) {
@@ -252,7 +264,7 @@ async function runCombinedTests(
   // Run vegeta attack with combined requests
   const { stdout } = await execa(
       'sh',
-      ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${rps} -duration=${duration} | vegeta report -type=json`],
+      ['-c', `printf '%s' "${attackInput.trim()}" | vegeta attack -rate=${rps} -duration=${duration} | vegeta report -type=json`],
       {
         stripFinalNewline: true,
         timeout: 300000 // 5 minutes timeout for the test
@@ -380,7 +392,17 @@ async function runTest(
     
     // Generate attack input with all requests in order - Vegeta will cycle through them
     for (const request of test.requests) {
-      attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+      let target = `${request.method.toUpperCase()} ${request.target}\n`;
+      if (request.headers) {
+        for (const [key, value] of Object.entries(request.headers)) {
+          target += `${key}: ${value}\n`;
+        }
+      }
+      target += '\n'; // Empty line to separate headers from body
+      if (request.body) {
+        target += request.body + '\n';
+      }
+      attackInput += target;
       requestCount++;
     }
   } else if (test.method && test.target) {
@@ -401,7 +423,7 @@ async function runTest(
   // Run vegeta attack and pipe to vegeta report
   const { stdout } = await execa(
       'sh',
-      ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${test.rps} -duration=${test.duration} | vegeta report -type=json`],
+      ['-c', `printf '%s' "${attackInput.trim()}" | vegeta attack -rate=${test.rps} -duration=${test.duration} | vegeta report -type=json`],
       {
         stripFinalNewline: true,
         timeout: 300000 // 5 minutes timeout for the test

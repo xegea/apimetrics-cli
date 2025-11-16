@@ -11,6 +11,8 @@ interface Config {
   rps: number;
   duration: string;
   id: string;
+  headers?: Record<string, string>;
+  body?: string;
 }
 
 interface RunOptions {
@@ -50,7 +52,16 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
     console.log(chalk.cyan(`🚀 Running load test on ${config.target} with ${config.rps} RPS for ${config.duration}`));
 
     // Run Vegeta load test
-    const attackInput = `${config.method.toUpperCase()} ${config.target}\n`;
+    let attackInput = `${config.method.toUpperCase()} ${config.target}\n`;
+    if (config.headers) {
+      for (const [key, value] of Object.entries(config.headers)) {
+        attackInput += `${key}: ${value}\n`;
+      }
+    }
+    attackInput += '\n'; // Empty line to separate headers from body
+    if (config.body) {
+      attackInput += config.body + '\n';
+    }
     
     let results: { 
       avgLatency: number; 
@@ -75,7 +86,7 @@ export async function runCommand(definitionPath: string, options: RunOptions): P
       // Run vegeta attack and pipe to vegeta report
       const { stdout } = await execa(
         'sh',
-        ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${config.rps} -duration=${config.duration} | vegeta report -type=json`],
+        ['-c', `printf '%s' "${attackInput.trim()}" | vegeta attack -rate=${config.rps} -duration=${config.duration} | vegeta report -type=json`],
         { 
           stripFinalNewline: true,
           timeout: 60000 // 1 minute timeout for the test

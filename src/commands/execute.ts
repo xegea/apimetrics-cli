@@ -35,6 +35,8 @@ export async function executeCommand(options: RunOptions): Promise<void> {
   const duration = process.env.APIMETRICS_DURATION || '30s';
   const id = process.env.APIMETRICS_ID || `embedded-${Date.now()}`;
   const token = options.token || process.env.APIMETRICS_TOKEN;
+  const headers = process.env.APIMETRICS_HEADERS ? JSON.parse(process.env.APIMETRICS_HEADERS) : undefined;
+  const body = process.env.APIMETRICS_BODY;
 
   // Validate required fields
   if (!target) {
@@ -54,14 +56,23 @@ export async function executeCommand(options: RunOptions): Promise<void> {
   }
 
   // Run Vegeta load test
-  const attackInput = `${method.toUpperCase()} ${target}\n`;
+  let attackInput = `${method.toUpperCase()} ${target}\n`;
+  if (headers) {
+    for (const [key, value] of Object.entries(headers)) {
+      attackInput += `${key}: ${value}\n`;
+    }
+  }
+  attackInput += '\n'; // Empty line to separate headers from body
+  if (body) {
+    attackInput += body + '\n';
+  }
   
   let results: { avgLatency: number; p95Latency: number; successRate: number; timestamp: string };
   
   try {
     const { stdout } = await execa(
       'sh',
-      ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${rps} -duration=${duration} | vegeta report -type=json`],
+      ['-c', `printf '%s' "${attackInput.trim()}" | vegeta attack -rate=${rps} -duration=${duration} | vegeta report -type=json`],
       { 
         stripFinalNewline: true,
         timeout: 60000
