@@ -45,6 +45,40 @@ interface RunOptions {
   env?: string;
 }
 
+interface LoadTestExecution {
+  id: string;
+  name: string;
+  status: string;
+  executionPlanId: string;
+}
+
+async function createLoadTestExecution(
+  executionPlanId: string,
+  name: string,
+  token: string,
+  apiUrl: string
+): Promise<LoadTestExecution | null> {
+  try {
+    const response = await axios.post(
+      `${apiUrl}/loadtestexecutions`,
+      {
+        executionPlanId,
+        name,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 10000,
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error(chalk.red('Failed to create load test execution:'), error instanceof Error ? error.message : String(error));
+    return null;
+  }
+}
+
 export async function executePlanCommand(planFile: string, options: RunOptions): Promise<void> {
   try {
     // Handle wildcard patterns by expanding them
@@ -110,31 +144,199 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
     // Check if Vegeta is available, download if not
     await ensureVegeta();
 
-    // Run each test
-    console.log(chalk.cyan(`\n🚀 Starting ${plan.tests.length} test(s)...\n`));
+    // Run all tests in a single load test execution
+    console.log(chalk.cyan(`\n🚀 Starting combined load test with ${plan.tests.length} test(s)...\n`));
 
-    let uploadFailures = 0;
-    for (let i = 0; i < plan.tests.length; i++) {
-      const test = plan.tests[i];
-      const uploadSuccess = await runTest(test, token, apiUrl, i + 1, plan.tests.length);
-      if (!uploadSuccess) {
-        uploadFailures++;
-      }
+    // Create a new load test execution first
+    const executionPlanId = plan.tests[0].id; // This is the execution plan ID
+    const executionName = `${plan.metadata.planName} - ${new Date().toLocaleString('en-US', { 
+      year: 'numeric', 
+      month: '2-digit', 
+      day: '2-digit', 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      hour12: false 
+    }).replace(',', '')}`;
+    
+    const newExecution = await createLoadTestExecution(executionPlanId, executionName, token, apiUrl);
+    
+    if (!newExecution) {
+      console.log(chalk.red(`\n❌ Failed to create load test execution. Aborting.`));
+      return;
     }
 
-    console.log(chalk.green(`\n🎉 All tests completed!`));
-    if (uploadFailures === 0) {
+    console.log(chalk.green(`✅ Created new load test execution: ${newExecution.id}`));
+
+    const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, newExecution.id);
+
+    if (uploadSuccess) {
+      console.log(chalk.green(`\n🎉 Load test completed!`));
       console.log(chalk.green(`📊 Results have been uploaded to your ApiMetrics dashboard`));
       console.log(chalk.green(`🌐 View results at: https://apimetrics.ai`));
     } else {
-      console.log(chalk.yellow(`⚠️  ${uploadFailures} test result(s) failed to upload. Please check the errors above.`));
-      console.log(chalk.yellow(`🔗 Try uploading again or check your API connection.`));
+      console.log(chalk.yellow(`\n⚠️  Test result failed to upload. Please check the errors above.`));
+      console.log(chalk.yellow(`🔗 Try running again or check your API connection.`));
     }
 
   } catch (error) {
     console.error(chalk.red("❌ Error:"), error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
+}
+
+async function runCombinedTests(
+  tests: ExecutionPlanFile['tests'],
+  token: string,
+  apiUrl: string,
+  planName: string,
+  executionId: string
+): Promise<boolean> {
+  console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test`));
+  
+  let attackInput = '';
+  let totalRequestCount = 0;
+  
+  // Collect all requests from all tests into a single attack input
+  for (const test of tests) {
+    if (test.requests && test.requests.length > 0) {
+      console.log(chalk.gray(`  • ${test.name}: ${test.requests.length} request(s)`));
+      for (const request of test.requests) {
+        attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+        totalRequestCount++;
+      }
+    } else if (test.method && test.target) {
+      console.log(chalk.gray(`  • ${test.name}: 1 request (legacy format)`));
+      attackInput += `${test.method.toUpperCase()} ${test.target}\n`;
+      totalRequestCount++;
+    }
+  }
+  
+  // Show all requests in the cycle loop
+  console.log(chalk.cyan(`\n  📋 Requests in cycle loop (will repeat in order):`));
+  const requestLines = attackInput.trim().split('\n');
+  requestLines.forEach((line, index) => {
+    console.log(chalk.gray(`     ${index + 1}. ${line}`));
+  });
+  
+  // Use settings from the first test (they should all be the same)
+  const firstTest = tests[0];
+  const rps = firstTest.rps;
+  const duration = firstTest.duration;
+  
+  console.log(chalk.gray(`  Total requests to cycle through: ${totalRequestCount}`));
+  console.log(chalk.gray(`  RPS: ${rps}, Duration: ${duration}`));
+  console.log("");
+
+  // Run vegeta attack with combined requests
+  const { stdout } = await execa(
+      'sh',
+      ['-c', `echo "${attackInput.trim()}" | vegeta attack -rate=${rps} -duration=${duration} | vegeta report -type=json`],
+      {
+        stripFinalNewline: true,
+        timeout: 300000 // 5 minutes timeout for the test
+      }
+    );
+
+    // Parse the JSON output
+    const report = JSON.parse(stdout);
+
+    console.log(chalk.green(`  ✅ Combined load test completed`));
+    console.log(chalk.gray(`     Total Requests: ${report.requests || 0}`));
+    console.log(chalk.gray(`     Duration: ${report.duration || 'N/A'}`));
+    console.log(chalk.gray(`     Rate: ${report.rate || 'N/A'} RPS`));
+    console.log(chalk.gray(`     Throughput: ${report.throughput || 'N/A'} req/sec`));
+    console.log(chalk.gray(`     Success Rate: ${(report.success * 100 || 0).toFixed(2)}%`));
+
+    // Extract detailed metrics
+    const latencies = report.latencies || {};
+    const statusCodes = report.status_codes || {};
+    const errors = report.errors || [];
+
+    console.log(chalk.cyan(`\n     📊 Detailed Metrics:`));
+    
+    // Latency metrics
+    console.log(chalk.gray(`     Response Times:`));
+    console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • Min:  ${(latencies.min / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • Max:  ${(latencies.max / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P50:  ${(latencies["50th"] / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P95:  ${(latencies["95th"] / 1000000 || 0).toFixed(2)}ms`));
+    console.log(chalk.gray(`       • P99:  ${(latencies["99th"] / 1000000 || 0).toFixed(2)}ms`));
+
+    // Data transfer
+    if (report.bytes_in || report.bytes_out) {
+      console.log(chalk.gray(`     Data Transfer:`));
+      if (report.bytes_in) {
+        console.log(chalk.gray(`       • Bytes In:  ${report.bytes_in.total || 0} total, ${(report.bytes_in.mean || 0).toFixed(0)} avg`));
+      }
+      if (report.bytes_out) {
+        console.log(chalk.gray(`       • Bytes Out: ${report.bytes_out.total || 0} total, ${(report.bytes_out.mean || 0).toFixed(0)} avg`));
+      }
+    }
+
+    // Status codes breakdown
+    if (Object.keys(statusCodes).length > 0) {
+      console.log(chalk.gray(`     Status Codes:`));
+      Object.entries(statusCodes).forEach(([code, count]) => {
+        const statusColor = parseInt(code) >= 200 && parseInt(code) < 300 ? chalk.green :
+                           parseInt(code) >= 400 && parseInt(code) < 500 ? chalk.yellow :
+                           parseInt(code) >= 500 ? chalk.red : chalk.gray;
+        console.log(statusColor(`       • ${code}: ${count}`));
+      });
+    }
+
+    // Errors
+    if (errors.length > 0) {
+      console.log(chalk.red(`     Errors (${errors.length}):`));
+      errors.slice(0, 5).forEach((error: string) => {
+        console.log(chalk.red(`       • ${error}`));
+      });
+      if (errors.length > 5) {
+        console.log(chalk.red(`       • ... and ${errors.length - 5} more`));
+      }
+    }
+
+    // Calculate success rate for upload
+    const totalRequests = report.requests || 1;
+    const successRequests = Object.entries(statusCodes)
+      .filter(([code]) => parseInt(code) >= 200 && parseInt(code) < 300)
+      .reduce((sum, [, count]) => sum + (count as number), 0);
+    const successRate = successRequests / totalRequests;
+
+    // Prepare results for upload - use the newly created execution ID
+    const results = {
+      executionId: executionId,
+      avgLatency: Math.round(latencies.mean || 0),
+      p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
+      successRate: successRate,
+      timestamp: new Date().toISOString(),
+      // Detailed metrics
+      minLatency: Math.round(latencies.min || 0),
+      maxLatency: Math.round(latencies.max || 0),
+      p50Latency: Math.round(latencies["50th"] || 0),
+      p99Latency: Math.round(latencies["99th"] || 0),
+      requests: report.requests,
+      duration: typeof report.duration === 'string' ? report.duration : `${(Number(report.duration) / 1000000000).toFixed(2)}s`,
+      rate: report.rate,
+      throughput: report.throughput,
+      bytesIn: report.bytes_in?.total,
+      bytesOut: report.bytes_out?.total,
+      statusCodes: statusCodes,
+      errors: errors,
+    };
+
+    console.log(chalk.cyan(`\n📦 Prepared results object:`));
+    console.log(chalk.gray(`  executionId: ${results.executionId}`));
+    console.log(chalk.gray(`  avgLatency: ${results.avgLatency} (type: ${typeof results.avgLatency})`));
+    console.log(chalk.gray(`  p95Latency: ${results.p95Latency} (type: ${typeof results.p95Latency})`));
+    console.log(chalk.gray(`  successRate: ${results.successRate} (type: ${typeof results.successRate})`));
+    console.log(chalk.gray(`  timestamp: ${results.timestamp}`));
+    console.log(chalk.gray(`  requests: ${results.requests} (type: ${typeof results.requests})`));
+
+    // Upload results
+    const uploadSuccess = await uploadResults(results, token, apiUrl, planName);
+    return uploadSuccess;
 }
 
 async function runTest(
@@ -284,6 +486,10 @@ async function uploadResults(
   testName: string
 ): Promise<boolean> {
   try {
+    console.log(chalk.cyan('\n📤 Uploading results...'));
+    console.log(chalk.gray('  Request data being sent:'));
+    console.log(chalk.gray(JSON.stringify(results, null, 2)));
+    
     const response = await axios.post(
       `${apiUrl}/results`,
       results,
@@ -296,15 +502,23 @@ async function uploadResults(
     );
 
     console.log(chalk.green(`  📊 Results uploaded successfully`));
+    console.log(chalk.gray(`  Response: ${response.status} ${response.statusText}`));
     return true;
   } catch (error) {
     if (axios.isAxiosError(error)) {
       console.error(chalk.red(`  ⚠️  Upload Error:`), error.message);
       if (error.response) {
-        console.error(chalk.red(`     Response: ${error.response.status} ${error.response.statusText}`));
+        console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
+        console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
+      } else if (error.request) {
+        console.error(chalk.red(`     No response received from server`));
+        console.error(chalk.red(`     Request details:`, error.request));
       }
     } else {
       console.error(chalk.red(`  ⚠️  Upload Error:`), error instanceof Error ? error.message : String(error));
+      if (error instanceof Error) {
+        console.error(chalk.red(`     Stack:`, error.stack));
+      }
     }
     // Don't throw - continue with other tests
     return false;
