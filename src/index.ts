@@ -60,7 +60,7 @@ program
 
 program
   .command("execute-plan <planFile>")
-  .description("Execute a load test plan from a JSON file (downloaded from dashboard)")
+  .description("Execute a load test plan from a JSON file (downloaded from Test Executions)")
   .option("--api-url <url>", "API endpoint URL (overrides environment-based defaults)")
   .option("--env <environment>", "Environment (local, dev, prod) - overrides NODE_ENV")
   .action(executePlanCommand);

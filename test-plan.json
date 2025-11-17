@@ -2,10 +2,11 @@
   "metadata": {
     "name": "Quick Test Plan",
     "planName": "Quick Test Plan",
-    "createdAt": "2025-11-15T18:00:00Z"
+    "createdAt": "2025-11-15T18:00:00Z",
+    "executionId": "test-execution-123"
   },
   "authentication": {
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ0ZXN0LXVzZXItMTIzIiwiZW1haWwiOiJ0ZXN0QGV4YW1wbGUuY29tIiwiaWF0IjoxNzYzMjMwNzA2LCJleHAiOjE3NjM4MzU1MDZ9.STeNrKlz6eTiYF19DzQNabckErFxOb6nHko3o4LuKAw",
+    "token": "eyJhbGciOiJIUzI1NiIsImtpZCI6IjVCMHFVY1h0dTJUQjNjWEkiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3p6cGlieHZqaHd2aHh1dmJvcmtyLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiI5YmJjMDc3Zi0yYWI5LTQ0N2QtOGNiOS00NDg4MmFkOGMyMjQiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzYzMzM4MDQ5LCJpYXQiOjE3NjMzMzQ0NDksImVtYWlsIjoieGF2aWVyLmVnZWFAZ21haWwuY29tIiwicGhvbmUiOiIiLCJhcHBfbWV0YWRhdGEiOnsicHJvdmlkZXIiOiJlbWFpbCIsInByb3ZpZGVycyI6WyJlbWFpbCJdfSwidXNlcl9tZXRhZGF0YSI6eyJlbWFpbCI6Inhhdmllci5lZ2VhQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJwaG9uZV92ZXJpZmllZCI6ZmFsc2UsInN1YiI6IjliYmMwNzdmLTJhYjktNDQ3ZC04Y2I5LTQ0ODgyYWQ4YzIyNCIsInRlbmFudF9pZCI6ImdtYWlsLmNvbSJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzYzMjIyMzM0fV0sInNlc3Npb25faWQiOiI5YTk3MWY1NC0yNDEwLTRmMjMtYTQ2My0xZjk3NWI4ZWU4ZWEiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.G8RQ884u1qqiUoH-_Fzm1Yr6iF-TXsgTQOJ86yuesa0",
     "tokenType": "Bearer"
   },
   "tests": [
@@ -13,18 +14,18 @@
       "id": "test-1",
       "name": "Test 1 - Simple GET",
       "method": "GET",
-      "target": "https://jsonplaceholder.typicode.com/posts/1",
-      "rps": 3,
-      "duration": "5s",
+      "target": "https://httpbin.org/get",
+      "rps": 2,
+      "duration": "3s",
       "description": "Quick test of simple endpoint"
     },
     {
       "id": "test-2", 
       "name": "Test 2 - Another GET",
       "method": "GET",
-      "target": "https://jsonplaceholder.typicode.com/posts/2",
-      "rps": 3,
-      "duration": "5s",
+      "target": "https://httpbin.org/uuid",
+      "rps": 2,
+      "duration": "3s",
       "description": "Another quick test"
     }
   ]

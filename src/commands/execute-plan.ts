@@ -8,6 +8,50 @@ import os from "os";
 import { writeFileSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
 
+interface RequestMetric {
+  timestamp: string;
+  latency: number;
+  statusCode: number;
+  bytesIn: number;
+  bytesOut: number;
+  error?: string;
+  url?: string; // Add URL to track which request this was
+}
+
+interface RequestMetricSummary {
+  requestIndex: number;
+  method: string;
+  target: string;
+  totalRequests: number;
+  avgLatency: number;
+  minLatency: number;
+  maxLatency: number;
+  p50Latency: number;
+  p95Latency: number;
+  p99Latency: number;
+  successRate: number;
+  bytesIn: number;
+  bytesOut: number;
+  statusCodes: Record<string, number>;
+  errors: string[];
+}
+
+function parseDuration(duration: string): number {
+  // Parse duration like "30s", "1m", "2h" to seconds
+  const match = duration.match(/^(\d+)([smh])$/);
+  if (!match) return 30; // default 30 seconds
+
+  const value = parseInt(match[1]);
+  const unit = match[2];
+
+  switch (unit) {
+    case 's': return value;
+    case 'm': return value * 60;
+    case 'h': return value * 3600;
+    default: return 30;
+  }
+}
+
 interface ExecutionPlanFile {
   metadata: {
     name: string;
@@ -65,6 +109,56 @@ interface ExecutionPlan {
   executionTime?: string;
   delayBetweenRequests?: string;
   iterations?: number;
+}
+
+async function extractPerRequestMetrics(
+  resultsFile: string
+): Promise<RequestMetric[]> {
+  try {
+    console.log(chalk.cyan('\n📊 Extracting per-request metrics...'));
+    const command = `cat "${resultsFile}" | /opt/homebrew/bin/vegeta encode -to json`;
+    
+    console.log(chalk.gray(`   Command: ${command}`));
+    const output = execSync(command, { encoding: 'utf-8' });
+    const lines = output.trim().split('\n').filter(line => line.trim());
+    
+    console.log(chalk.gray(`   Raw output lines parsed: ${lines.length}`));
+    
+    const metrics: RequestMetric[] = lines.map(line => {
+      const parsed = JSON.parse(line);
+      return {
+        timestamp: new Date(parsed.timestamp).toISOString(),
+        latency: parsed.latency,
+        statusCode: parsed.code,
+        bytesIn: parsed.in || 0,  // Default to 0 if undefined
+        bytesOut: parsed.out || 0,  // Default to 0 if undefined
+        error: parsed.error || undefined,
+        url: parsed.url, // Capture the actual URL that was requested
+      };
+    });
+
+    console.log(chalk.green(`   ✅ Successfully extracted ${metrics.length} metrics`));
+    
+    // Show sample metrics
+    if (metrics.length > 0) {
+      console.log(chalk.gray(`   Sample metrics (first 3):`));
+      metrics.slice(0, 3).forEach((metric, idx) => {
+        const latencyMs = (metric.latency / 1000000).toFixed(2);
+        console.log(chalk.gray(`     ${idx + 1}. Status: ${metric.statusCode}, Latency: ${latencyMs}ms, Bytes In: ${metric.bytesIn}, Bytes Out: ${metric.bytesOut}${metric.error ? `, Error: ${metric.error}` : ''}`));
+      });
+      if (metrics.length > 3) {
+        console.log(chalk.gray(`     ... and ${metrics.length - 3} more`));
+      }
+    }
+
+    return metrics;
+  } catch (error) {
+    console.error(
+      chalk.red(`\n  ❌ Error extracting per-request metrics:`,
+      error instanceof Error ? error.message : String(error))
+    );
+    return [];
+  }
 }
 
 async function createOrGetExecutionPlan(
@@ -190,7 +284,7 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
     // Get the LoadTestExecution ID from the execution plan file
     const executionId = plan.metadata.executionId;
     if (!executionId) {
-      throw new Error("No execution ID found in execution plan file. Please download a fresh execution plan from the dashboard.");
+      throw new Error("No execution ID found in execution plan file. Please download a fresh execution plan from Test Executions.");
     }
 
     console.log(chalk.cyan(`\n🚀 Starting load tests for execution: ${executionId}\n`));
@@ -220,10 +314,10 @@ async function runCombinedTests(
   executionId: string
 ): Promise<boolean> {
   console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test`));
-  
+
   let attackInput = '';
   let totalRequestCount = 0;
-  
+
   // Collect all requests from all tests into a single attack input
   for (const test of tests) {
     if (test.requests && test.requests.length > 0) {
@@ -250,19 +344,19 @@ async function runCombinedTests(
       totalRequestCount++;
     }
   }
-  
+
   // Show all requests in the cycle loop
   console.log(chalk.cyan(`\n  📋 Requests in cycle loop (will repeat in order):`));
   const requestLines = attackInput.trim().split('\n');
   requestLines.forEach((line, index) => {
     console.log(chalk.gray(`     ${index + 1}. ${line}`));
   });
-  
+
   // Use settings from the first test (they should all be the same)
   const firstTest = tests[0];
   const rps = firstTest.rps;
   const duration = firstTest.duration;
-  
+
   console.log(chalk.gray(`  Total requests to cycle through: ${totalRequestCount}`));
   console.log(chalk.gray(`  RPS: ${rps}, Duration: ${duration}`));
   console.log("");
@@ -272,12 +366,12 @@ async function runCombinedTests(
   const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
   const tempFile = path.join(tempDir, `vegeta-requests-${uniqueId}.txt`);
   const resultsFile = path.join(tempDir, `vegeta-results-${uniqueId}.bin`);
-  
+
   try {
     // Write requests to temporary file (ensure there's a final newline)
     const fileContent = attackInput.trim() + '\n';
     writeFileSync(tempFile, fileContent, 'utf8');
-    
+
     // Debug: Show file content
     console.log(chalk.gray(`\n  📝 Vegeta input file: ${tempFile}`));
     console.log(chalk.gray(`  📊 File size: ${fileContent.length} bytes`));
@@ -289,7 +383,7 @@ async function runCombinedTests(
     if (fileContent.trim().split('\n').length > 10) {
       console.log(chalk.gray(`     ... (${fileContent.trim().split('\n').length - 10} more lines)`));
     }
-    
+
     // Run vegeta attack using the file with separate processes (not piped) to avoid resource issues
     // First, run attack and save results to binary file
     try {
@@ -300,7 +394,7 @@ async function runCombinedTests(
       console.error(chalk.red(`\n❌ Vegeta attack failed:`));
       console.error(chalk.red(`  Command: vegeta attack -rate=${rps} -duration=${duration}`));
       console.error(chalk.red(`  Error: ${vegeteaError instanceof Error ? vegeteaError.message : String(vegeteaError)}`));
-      
+
       // Try to read the input file to debug
       try {
         const content = await fs.readFile(tempFile, 'utf8');
@@ -309,10 +403,10 @@ async function runCombinedTests(
       } catch (e) {
         // ignore
       }
-      
+
       throw vegeteaError;
     }
-    
+
     // Then read the binary results and generate report
     try {
       const result = execSync(`/opt/homebrew/bin/vegeta report -type=json < "${resultsFile}"`, { encoding: 'utf8', shell: '/bin/bash' });
@@ -334,7 +428,7 @@ async function runCombinedTests(
       const errors = report.errors || [];
 
       console.log(chalk.cyan(`\n     📊 Detailed Metrics:`));
-      
+
       // Latency metrics
       console.log(chalk.gray(`     Response Times:`));
       console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
@@ -391,32 +485,140 @@ async function runCombinedTests(
         p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
         successRate: successRate,
         timestamp: new Date().toISOString(),
-        // Detailed metrics
         minLatency: Math.round(latencies.min || 0),
         maxLatency: Math.round(latencies.max || 0),
-        p50Latency: Math.round(latencies["50th"] || 0),
-        p99Latency: Math.round(latencies["99th"] || 0),
-        requests: report.requests,
-        duration: typeof report.duration === 'string' ? report.duration : `${(Number(report.duration) / 1000000000).toFixed(2)}s`,
-        rate: report.rate,
+        p50Latency: Math.round(latencies["50th"] || latencies.mean || 0),
+        p99Latency: Math.round(latencies["99th"] || latencies.mean || 0),
+        totalRequests: totalRequests,
+        testDuration: duration,
+        actualRate: report.rate,
         throughput: report.throughput,
         bytesIn: report.bytes_in?.total,
         bytesOut: report.bytes_out?.total,
-        statusCodes: statusCodes,
-        errors: errors,
+        statusCodes: JSON.stringify(statusCodes),
+        errorDetails: JSON.stringify(errors),
       };
 
-      console.log(chalk.cyan(`\n📦 Prepared results object:`));
+      console.log(chalk.cyan(`\n� Prepared results object:`));
       console.log(chalk.gray(`  executionId: ${results.executionId}`));
       console.log(chalk.gray(`  avgLatency: ${results.avgLatency} (type: ${typeof results.avgLatency})`));
       console.log(chalk.gray(`  p95Latency: ${results.p95Latency} (type: ${typeof results.p95Latency})`));
       console.log(chalk.gray(`  successRate: ${results.successRate} (type: ${typeof results.successRate})`));
       console.log(chalk.gray(`  timestamp: ${results.timestamp}`));
-      console.log(chalk.gray(`  requests: ${results.requests} (type: ${typeof results.requests})`));
+      console.log(chalk.gray(`  requests: ${results.totalRequests} (type: ${typeof results.totalRequests})`));
+
+      // Extract per-request metrics before creating test result
+      let requestMetrics: RequestMetric[] = [];
+      try {
+        requestMetrics = await extractPerRequestMetrics(resultsFile);
+      } catch (metricsError) {
+        console.warn(chalk.yellow(`⚠️  Failed to extract per-request metrics: ${metricsError instanceof Error ? metricsError.message : String(metricsError)}`));
+        // Continue without per-request metrics - not critical
+      }
+
+      // Group metrics by request type and create aggregated summaries
+      let requestMetricSummaries: RequestMetricSummary[] = [];
+      console.log(chalk.gray(`\n   📊 Debug: requestMetrics.length = ${requestMetrics.length}`));
+      if (requestMetrics.length > 0) {
+        console.log(chalk.cyan(`\n📊 Aggregating metrics by request type...`));
+
+        // Build request list in the same order as they appear in the attack input
+        const requestList: Array<{ method: string; target: string; index: number }> = [];
+        let currentIndex = 0;
+
+        for (const test of tests) {
+          if (test.requests && test.requests.length > 0) {
+            for (const request of test.requests) {
+              requestList.push({
+                method: request.method.toUpperCase(),
+                target: request.target,
+                index: currentIndex++
+              });
+            }
+          } else if (test.method && test.target) {
+            requestList.push({
+              method: test.method.toUpperCase(),
+              target: test.target,
+              index: currentIndex++
+            });
+          }
+        }
+
+        // Group metrics by the actual URL that was requested (from Vegeta output)
+        const metricsByUrl: { [url: string]: RequestMetric[] } = {};
+        
+        requestMetrics.forEach((metric) => {
+          if (metric.url) {
+            if (!metricsByUrl[metric.url]) {
+              metricsByUrl[metric.url] = [];
+            }
+            metricsByUrl[metric.url].push(metric);
+          }
+        });
+
+        // Create aggregated summaries for each unique URL
+        requestMetricSummaries = Object.entries(metricsByUrl).map(([url, metrics], idx) => {
+          // Find the matching request to get method
+          const matchingRequest = requestList.find(r => r.target === url);
+          const method = matchingRequest?.method || 'UNKNOWN';
+
+          // Calculate aggregated statistics
+          const latencies = metrics.map(m => m.latency).sort((a, b) => a - b);
+          const totalRequests = metrics.length;
+          const avgLatency = latencies.reduce((a, b) => a + b, 0) / totalRequests;
+          const minLatency = Math.min(...latencies);
+          const maxLatency = Math.max(...latencies);
+          const p50Index = Math.floor(totalRequests * 0.5);
+          const p95Index = Math.floor(totalRequests * 0.95);
+          const p99Index = Math.floor(totalRequests * 0.99);
+
+          const successCount = metrics.filter(m => m.statusCode >= 200 && m.statusCode < 300).length;
+          const successRate = successCount / totalRequests;
+
+          const statusCodes: { [key: string]: number } = {};
+          const errors: string[] = [];
+          const errorSet = new Set<string>(); // Track unique errors per URL
+
+          metrics.forEach((m) => {
+            statusCodes[m.statusCode] = (statusCodes[m.statusCode] || 0) + 1;
+            // Only include errors that actually occurred for this URL
+            if (m.error && m.error.trim() && !errorSet.has(m.error)) {
+              errorSet.add(m.error);
+              errors.push(m.error);
+            }
+          });
+
+          const bytesIn = metrics.reduce((sum, m) => sum + m.bytesIn, 0);
+          const bytesOut = metrics.reduce((sum, m) => sum + m.bytesOut, 0);
+
+          return {
+            requestIndex: idx,
+            method,
+            target: url,
+            totalRequests,
+            avgLatency: Math.round(avgLatency),
+            minLatency: Math.round(minLatency),
+            maxLatency: Math.round(maxLatency),
+            p50Latency: Math.round(latencies[p50Index] || avgLatency),
+            p95Latency: Math.round(latencies[p95Index] || avgLatency),
+            p99Latency: Math.round(latencies[p99Index] || avgLatency),
+            successRate,
+            bytesIn,
+            bytesOut,
+            statusCodes,
+            errors,
+          };
+        });
+
+        console.log(chalk.green(`   ✅ Created ${requestMetricSummaries.length} aggregated summaries`));
+        requestMetricSummaries.forEach((summary, idx) => {
+          console.log(chalk.gray(`     ${idx + 1}. ${summary.method} ${summary.target}: ${summary.totalRequests} reqs, ${(summary.successRate * 100).toFixed(1)}% success`));
+        });
+      }
 
       // Create test result in the execution
       const testId = tests[0].id || 'default-test';
-      const resultCreated = await createTestResult(executionId, testId, results, token, apiUrl);
+      const resultCreated = await createTestResult(executionId, testId, results, token, apiUrl, requestMetricSummaries);
       return resultCreated;
     } catch (reportError) {
       console.error(chalk.red(`\n❌ Report generation failed:`));
@@ -622,8 +824,19 @@ async function runTest(
         errors: errors,
       };
 
+      // Extract per-request metrics before uploading
+      let requestMetrics: RequestMetric[] = [];
+      let requestMetricSummaries: RequestMetricSummary[] = [];
+      // Note: Using aggregated approach now - individual metrics extraction removed
+      // try {
+      //   requestMetrics = await extractPerRequestMetrics(resultsFile);
+      // } catch (metricsError) {
+      //   console.warn(chalk.yellow(`⚠️  Failed to extract per-request metrics: ${metricsError instanceof Error ? metricsError.message : String(metricsError)}`));
+      //   // Continue without per-request metrics - not critical
+      // }
+
       // Upload results
-      const uploadSuccess = await uploadResults(results, token, apiUrl, test.name);
+      const uploadSuccess = await uploadResults(results, token, apiUrl, test.name, requestMetricSummaries);
       return uploadSuccess;
     } catch (reportError) {
       console.error(chalk.red(`\n❌ Report generation failed:`));
@@ -650,7 +863,8 @@ async function createTestResult(
   testId: string,
   results: any,
   token: string,
-  apiUrl: string
+  apiUrl: string,
+  requestMetrics?: RequestMetricSummary[]
 ): Promise<boolean> {
   try {
     console.log(chalk.cyan('\n📤 Creating test result...'));
@@ -671,9 +885,44 @@ async function createTestResult(
       throughput: results.throughput,
       bytesIn: results.bytesIn,
       bytesOut: results.bytesOut,
-      statusCodes: JSON.stringify(results.statusCodes || {}),
-      errorDetails: JSON.stringify(results.errors || []),
+      statusCodes: results.statusCodes,  // Already stringified in results object
+      errorDetails: results.errorDetails,  // Already stringified in results object (JSON string)
+      requestMetrics: requestMetrics || [],
     };
+    
+    // Log the metrics being sent
+    console.log(chalk.gray(`\n   📊 Test Result Summary:`));
+    console.log(chalk.gray(`      - Execution ID: ${executionId}`));
+    console.log(chalk.gray(`      - Test ID: ${testId}`));
+    console.log(chalk.gray(`      - Total Requests: ${resultData.totalRequests}`));
+    console.log(chalk.gray(`      - Avg Latency: ${(resultData.avgLatency / 1000000).toFixed(2)}ms`));
+    console.log(chalk.gray(`      - Success Rate: ${(resultData.successRate * 100).toFixed(2)}%`));
+    
+    // Log request metrics being sent
+    console.log(chalk.cyan(`\n   📋 Request Metrics Debug:`));
+    console.log(chalk.gray(`      - Type: ${typeof requestMetrics}`));
+    console.log(chalk.gray(`      - Is Array: ${Array.isArray(requestMetrics)}`));
+    console.log(chalk.gray(`      - Length: ${requestMetrics?.length ?? 'undefined'}`));
+    
+    if (requestMetrics && requestMetrics.length > 0) {
+      console.log(chalk.cyan(`\n   📋 Per-Request Metrics being sent:`));
+      console.log(chalk.gray(`      - Count: ${requestMetrics.length} aggregated metrics`));
+      console.log(chalk.gray(`      - Sample metrics (first 3):`));
+      requestMetrics.slice(0, 3).forEach((metric, idx) => {
+        console.log(chalk.gray(`        ${idx + 1}. ${metric.method} ${metric.target}: ${metric.totalRequests} reqs, ${(metric.successRate * 100).toFixed(1)}% success, Avg: ${(metric.avgLatency / 1000000).toFixed(2)}ms, P95: ${(metric.p95Latency / 1000000).toFixed(2)}ms`));
+      });
+      if (requestMetrics.length > 3) {
+        console.log(chalk.gray(`        ... and ${requestMetrics.length - 3} more`));
+      }
+      console.log(chalk.gray(`\n   Full payload being sent:`));
+      console.log(chalk.gray(JSON.stringify(resultData, null, 2)));
+    } else {
+      console.log(chalk.yellow(`\n   ⚠️  No request metrics to send (requestMetrics is ${requestMetrics ? 'empty' : 'undefined'})`));
+      console.log(chalk.gray(`\n   Full payload being sent:`));
+      console.log(chalk.gray(JSON.stringify(resultData, null, 2)));
+    }
+    
+    console.log(chalk.gray(`\n   🔗 Posting to: ${apiUrl}/loadtestsexecutions/${executionId}/loadtests`));
     
     const response = await axios.post(
       `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
@@ -686,18 +935,19 @@ async function createTestResult(
       }
     );
 
-    console.log(chalk.green(`  ✅ Test result created successfully`));
-    console.log(chalk.gray(`  Response: ${response.status} ${response.statusText}`));
+    console.log(chalk.green(`\n   ✅ Test result created successfully`));
+    console.log(chalk.gray(`      Response: ${response.status} ${response.statusText}`));
+    console.log(chalk.gray(`      Test Result ID: ${response.data.id}`));
     return true;
   } catch (error) {
     if (axios.isAxiosError(error)) {
-      console.error(chalk.red(`  ⚠️  Result creation error:`), error.message);
+      console.error(chalk.red(`\n   ⚠️  Result creation error:`), error.message);
       if (error.response) {
-        console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
-        console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
+        console.error(chalk.red(`      Response Status: ${error.response.status} ${error.response.statusText}`));
+        console.error(chalk.red(`      Response Data:`, JSON.stringify(error.response.data, null, 2)));
       }
     } else {
-      console.error(chalk.red(`  ⚠️  Unexpected error:`, error instanceof Error ? error.message : String(error)));
+      console.error(chalk.red(`\n   ⚠️  Unexpected error:`, error instanceof Error ? error.message : String(error)));
     }
     return false;
   }
@@ -707,16 +957,28 @@ async function uploadResults(
   results: any,
   token: string,
   apiUrl: string,
-  testName: string
+  testName: string,
+  requestMetricSummaries?: RequestMetricSummary[],
+  executionId?: string
 ): Promise<boolean> {
   try {
     console.log(chalk.cyan('\n📤 Uploading results...'));
     console.log(chalk.gray('  Request data being sent:'));
     console.log(chalk.gray(JSON.stringify(results, null, 2)));
     
+    // Add request metrics to the payload if available
+    const payload = {
+      ...results,
+      requestMetrics: requestMetricSummaries || []
+    };
+    
+    if (requestMetricSummaries && requestMetricSummaries.length > 0) {
+      console.log(chalk.gray(`  Including ${requestMetricSummaries.length} per-request metrics`));
+    }
+    
     const response = await axios.post(
-      `${apiUrl}/results`,
-      results,
+      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
+      payload,
       {
         headers: {
           Authorization: `Bearer ${token}`,
