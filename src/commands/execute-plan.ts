@@ -7,6 +7,7 @@ import chalk from "chalk";
 import os from "os";
 import { writeFileSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
+import readline from "readline";
 
 interface RequestMetric {
   timestamp: string;
@@ -15,7 +16,7 @@ interface RequestMetric {
   bytesIn: number;
   bytesOut: number;
   error?: string;
-  url?: string; // Add URL to track which request this was
+  url?: string;
 }
 
 interface RequestMetricSummary {
@@ -36,14 +37,26 @@ interface RequestMetricSummary {
   errors: string[];
 }
 
-function parseDuration(duration: string): number {
-  // Parse duration like "30s", "1m", "2h" to seconds
-  const match = duration.match(/^(\d+)([smh])$/);
-  if (!match) return 30; // default 30 seconds
+interface BucketState {
+  bucketKey: number;
+  startTime: Date;
+  endTime: Date;
+  metrics: RequestMetric[];
+  totalRequests: number;
+  successCount: number;
+  failureCount: number;
+  statusCodes: Record<string, number>;
+  errorSet: Set<string>;
+  bytesIn: number;
+  bytesOut: number;
+  latencies: number[];
+}
 
+function parseDuration(duration: string): number {
+  const match = duration.match(/^(\d+)([smh])$/);
+  if (!match) return 30;
   const value = parseInt(match[1]);
   const unit = match[2];
-
   switch (unit) {
     case 's': return value;
     case 'm': return value * 60;
@@ -52,13 +65,19 @@ function parseDuration(duration: string): number {
   }
 }
 
+function calculatePercentile(sortedLatencies: number[], percentile: number): number {
+  if (sortedLatencies.length === 0) return 0;
+  const index = Math.floor(sortedLatencies.length * percentile);
+  return sortedLatencies[Math.max(0, index - 1)] || sortedLatencies[0];
+}
+
 interface ExecutionPlanFile {
   metadata: {
     name: string;
     planName: string;
     createdAt: string;
     description?: string;
-    executionId?: string; // The LoadTestExecution ID to add results to
+    executionId?: string;
   };
   authentication: {
     token: string;
@@ -75,7 +94,6 @@ interface ExecutionPlanFile {
       headers?: Record<string, string>;
       body?: string;
     }>;
-    // Legacy fields for backward compatibility
     method?: string;
     target?: string;
     rps: number;
@@ -111,53 +129,444 @@ interface ExecutionPlan {
   iterations?: number;
 }
 
-async function extractPerRequestMetrics(
-  resultsFile: string
-): Promise<RequestMetric[]> {
+async function uploadMetricsBucket(
+  executionId: string,
+  bucketNumber: number,
+  bucketState: BucketState,
+  token: string,
+  apiUrl: string
+): Promise<boolean> {
   try {
-    console.log(chalk.cyan('\n📊 Extracting per-request metrics...'));
-    const command = `cat "${resultsFile}" | /opt/homebrew/bin/vegeta encode -to json`;
-    
-    console.log(chalk.gray(`   Command: ${command}`));
-    const output = execSync(command, { encoding: 'utf-8' });
-    const lines = output.trim().split('\n').filter(line => line.trim());
-    
-    console.log(chalk.gray(`   Raw output lines parsed: ${lines.length}`));
-    
-    const metrics: RequestMetric[] = lines.map(line => {
-      const parsed = JSON.parse(line);
-      return {
-        timestamp: new Date(parsed.timestamp).toISOString(),
-        latency: parsed.latency,
-        statusCode: parsed.code,
-        bytesIn: parsed.in || 0,  // Default to 0 if undefined
-        bytesOut: parsed.out || 0,  // Default to 0 if undefined
-        error: parsed.error || undefined,
-        url: parsed.url, // Capture the actual URL that was requested
-      };
-    });
-
-    console.log(chalk.green(`   ✅ Successfully extracted ${metrics.length} metrics`));
-    
-    // Show sample metrics
-    if (metrics.length > 0) {
-      console.log(chalk.gray(`   Sample metrics (first 3):`));
-      metrics.slice(0, 3).forEach((metric, idx) => {
-        const latencyMs = (metric.latency / 1000000).toFixed(2);
-        console.log(chalk.gray(`     ${idx + 1}. Status: ${metric.statusCode}, Latency: ${latencyMs}ms, Bytes In: ${metric.bytesIn}, Bytes Out: ${metric.bytesOut}${metric.error ? `, Error: ${metric.error}` : ''}`));
-      });
-      if (metrics.length > 3) {
-        console.log(chalk.gray(`     ... and ${metrics.length - 3} more`));
-      }
+    if (bucketState.metrics.length === 0) {
+      return true;
     }
 
-    return metrics;
-  } catch (error) {
-    console.error(
-      chalk.red(`\n  ❌ Error extracting per-request metrics:`,
-      error instanceof Error ? error.message : String(error))
+    const sortedLatencies = bucketState.latencies.sort((a, b) => a - b);
+    const totalRequests = bucketState.metrics.length;
+    const avgLatency = sortedLatencies.reduce((a, b) => a + b, 0) / totalRequests;
+    const minLatency = Math.min(...sortedLatencies);
+    const maxLatency = Math.max(...sortedLatencies);
+
+    const bucketData = {
+      bucketNumber,
+      startTime: bucketState.startTime.toISOString(),
+      endTime: bucketState.endTime.toISOString(),
+      totalRequests,
+      successCount: bucketState.successCount,
+      failureCount: bucketState.failureCount,
+      avgLatency: Math.round(avgLatency),
+      minLatency: Math.round(minLatency),
+      maxLatency: Math.round(maxLatency),
+      p50Latency: Math.round(calculatePercentile(sortedLatencies, 0.5)),
+      p95Latency: Math.round(calculatePercentile(sortedLatencies, 0.95)),
+      p99Latency: Math.round(calculatePercentile(sortedLatencies, 0.99)),
+      successRate: bucketState.successCount / totalRequests,
+      bytesIn: bucketState.bytesIn,
+      bytesOut: bucketState.bytesOut,
+      statusCodes: bucketState.statusCodes,
+      errors: Array.from(bucketState.errorSet),
+    };
+
+    console.log(chalk.cyan(`\n   📦 Uploading metrics bucket #${bucketNumber}...`));
+    console.log(chalk.gray(`      Time Range: ${bucketState.startTime.toISOString()} → ${bucketState.endTime.toISOString()}`));
+    console.log(chalk.gray(`      Requests: ${totalRequests} (${bucketState.successCount} success, ${bucketState.failureCount} failed)`));
+    console.log(chalk.gray(`      Avg Latency: ${(bucketData.avgLatency / 1000000).toFixed(2)}ms`));
+
+    const response = await axios.post(
+      `${apiUrl}/loadtestsexecutions/${executionId}/buckets`,
+      bucketData,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      }
     );
-    return [];
+
+    console.log(chalk.green(`      ✅ Bucket #${bucketNumber} uploaded (ID: ${response.data.id})`));
+    return true;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      console.error(chalk.red(`      ❌ Bucket upload error:`), error.message);
+    } else {
+      console.error(chalk.red(`      ❌ Unexpected error:`, error instanceof Error ? error.message : String(error)));
+    }
+    return false;
+  }
+}
+
+async function createTestResult(
+  executionId: string,
+  testId: string,
+  results: any,
+  token: string,
+  apiUrl: string,
+  requestMetrics?: RequestMetricSummary[]
+): Promise<boolean> {
+  try {
+    console.log(chalk.cyan('\n📤 Uploading final TestResult...'));
+    
+    const payload = {
+      ...results,
+      requestMetrics: requestMetrics || []
+    };
+
+    if (requestMetrics && requestMetrics.length > 0) {
+      console.log(chalk.gray(`  Including ${requestMetrics.length} per-request metrics`));
+    }
+    
+    console.log(chalk.gray(`\n  📊 TestResult Summary:`));
+    console.log(chalk.gray(`     - Execution ID: ${executionId}`));
+    console.log(chalk.gray(`     - Total Requests: ${results.totalRequests}`));
+    console.log(chalk.gray(`     - Success Rate: ${(results.successRate * 100).toFixed(2)}%`));
+    console.log(chalk.gray(`     - Avg Latency: ${(results.avgLatency / 1000000).toFixed(2)}ms`));
+    console.log(chalk.gray(`     - P95 Latency: ${(results.p95Latency / 1000000).toFixed(2)}ms`));
+
+    console.log(chalk.gray(`\n  🔗 Posting TestResult to: ${apiUrl}/loadtestsexecutions/${executionId}/loadtests`));
+
+    const response = await axios.post(
+      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log(chalk.green(`\n  ✅ TestResult uploaded successfully`));
+    console.log(chalk.gray(`     Response Status: ${response.status} ${response.statusText}`));
+    return true;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      console.error(chalk.red(`\n  ⚠️  TestResult upload error:`), error.message);
+      if (error.response) {
+        console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
+        console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
+      }
+    } else {
+      console.error(chalk.red(`\n  ⚠️  Unexpected error:`, error instanceof Error ? error.message : String(error)));
+    }
+    return false;
+  }
+}
+
+async function runCombinedTests(
+  tests: ExecutionPlanFile['tests'],
+  token: string,
+  apiUrl: string,
+  planName: string,
+  executionId: string
+): Promise<boolean> {
+  console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test with REAL-TIME streaming metrics`));
+
+  let attackInput = '';
+  let totalRequestCount = 0;
+
+  // Collect all requests
+  for (const test of tests) {
+    if (test.requests && test.requests.length > 0) {
+      console.log(chalk.gray(`  • ${test.name}: ${test.requests.length} request(s)`));
+      for (const request of test.requests) {
+        attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
+        if (request.headers) {
+          for (const [key, value] of Object.entries(request.headers)) {
+            attackInput += `${key}: ${value}\n`;
+          }
+        }
+        attackInput += '\n';
+        if (request.body) {
+          attackInput += `${request.body}\n`;
+        }
+        totalRequestCount++;
+      }
+    } else if (test.method && test.target) {
+      console.log(chalk.gray(`  • ${test.name}: 1 request (legacy format)`));
+      attackInput += `${test.method.toUpperCase()} ${test.target}\n\n`;
+      totalRequestCount++;
+    }
+  }
+
+  console.log(chalk.cyan(`\n  📋 Requests in cycle loop (will repeat in order):`));
+  const requestLines = attackInput.trim().split('\n');
+  requestLines.slice(0, 10).forEach((line, index) => {
+    console.log(chalk.gray(`     ${index + 1}. ${line}`));
+  });
+  if (requestLines.length > 10) {
+    console.log(chalk.gray(`     ... (${requestLines.length - 10} more lines)`));
+  }
+
+  const firstTest = tests[0];
+  const rps = firstTest.rps;
+  const duration = firstTest.duration;
+
+  console.log(chalk.gray(`  Total requests to cycle through: ${totalRequestCount}`));
+  console.log(chalk.gray(`  RPS: ${rps}, Duration: ${duration}`));
+  console.log("");
+
+  const tempDir = os.tmpdir();
+  const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
+  const tempFile = path.join(tempDir, `vegeta-requests-${uniqueId}.txt`);
+
+  try {
+    const fileContent = attackInput.trim() + '\n';
+    writeFileSync(tempFile, fileContent, 'utf8');
+
+    console.log(chalk.gray(`\n  📝 Vegeta input file: ${tempFile}`));
+    console.log(chalk.gray(`  📊 File size: ${fileContent.length} bytes`));
+
+    // REAL-TIME STREAMING MODE: vegeta attack | vegeta encode -to json
+    console.log(chalk.cyan(`\n🚀 Starting real-time streaming metrics collection...`));
+    console.log(chalk.cyan(`   Processing Vegeta output line-by-line as it arrives...`));
+    
+    const allMetrics: RequestMetric[] = [];
+    const buckets: Map<number, BucketState> = new Map();
+    const uploadedBuckets = new Set<number>(); // Track which buckets have been uploaded
+    const bucketDuration = 5000; // 5 seconds
+    let firstMetricTime: number | null = null;
+    let totalRequests = 0;
+    let successRequests = 0;
+    const allStatusCodes: Record<string, number> = {};
+    const allErrorSet = new Set<string>();
+    let totalBytesIn = 0;
+    let totalBytesOut = 0;
+    const allLatencies: number[] = [];
+
+    try {
+      // Stream vegeta output: cat file | vegeta attack | vegeta encode -to json
+      const cmd = `cat "${tempFile}" | vegeta attack -rate=${rps} -duration=${duration} -timeout=30s | vegeta encode -to json`;
+      
+      // Use stdout: 'pipe' to stream output in real-time
+      const vegeta = execa('sh', ['-c', cmd], {
+        timeout: 600000,
+        stdout: 'pipe',
+      });
+
+      // Create readline interface to process JSON lines as they arrive
+      const rl = readline.createInterface({
+        input: vegeta.stdout as any,
+        crlfDelay: Infinity,
+      });
+
+      // Process each JSON line in real-time
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+
+        try {
+          const parsed = JSON.parse(line);
+          
+          const timestamp = new Date(parsed.timestamp);
+          const latency = parsed.latency;
+          const statusCode = parsed.code;
+          const bytesIn = parsed.in || 0;
+          const bytesOut = parsed.out || 0;
+          const error = parsed.error || undefined;
+          const url = parsed.url;
+
+          const metric: RequestMetric = {
+            timestamp: timestamp.toISOString(),
+            latency,
+            statusCode,
+            bytesIn,
+            bytesOut,
+            error,
+            url,
+          };
+
+          allMetrics.push(metric);
+          totalRequests++;
+          
+          if (statusCode >= 200 && statusCode < 300) {
+            successRequests++;
+          }
+
+          allStatusCodes[statusCode] = (allStatusCodes[statusCode] || 0) + 1;
+          if (error && error.trim()) {
+            allErrorSet.add(error);
+          }
+
+          totalBytesIn += bytesIn;
+          totalBytesOut += bytesOut;
+          allLatencies.push(latency);
+
+          // Initialize first metric time
+          if (firstMetricTime === null) {
+            firstMetricTime = timestamp.getTime();
+            console.log(chalk.gray(`\n   Execution started at: ${timestamp.toISOString()}`));
+          }
+
+          // Assign to bucket based on 5-second windows from first metric
+          const metricTime = timestamp.getTime();
+          const bucketKey = Math.floor((metricTime - firstMetricTime) / bucketDuration);
+
+          // Create bucket if it doesn't exist
+          if (!buckets.has(bucketKey)) {
+            const bucketStart = new Date(firstMetricTime + bucketKey * bucketDuration);
+            const bucketEnd = new Date(bucketStart.getTime() + bucketDuration);
+            
+            buckets.set(bucketKey, {
+              bucketKey,
+              startTime: bucketStart,
+              endTime: bucketEnd,
+              metrics: [],
+              totalRequests: 0,
+              successCount: 0,
+              failureCount: 0,
+              statusCodes: {},
+              errorSet: new Set<string>(),
+              bytesIn: 0,
+              bytesOut: 0,
+              latencies: [],
+            });
+          }
+
+          // Add metric to current bucket
+          const bucket = buckets.get(bucketKey)!;
+          bucket.metrics.push(metric);
+          bucket.totalRequests++;
+          bucket.latencies.push(latency);
+          bucket.bytesIn += bytesIn;
+          bucket.bytesOut += bytesOut;
+          bucket.statusCodes[statusCode] = (bucket.statusCodes[statusCode] || 0) + 1;
+
+          if (statusCode >= 200 && statusCode < 300) {
+            bucket.successCount++;
+          } else {
+            bucket.failureCount++;
+          }
+
+          if (error && error.trim()) {
+            bucket.errorSet.add(error);
+          }
+
+          // Check if we've moved to a new bucket - if so, upload the previous one IMMEDIATELY
+          const prevBucketKey = bucketKey - 1;
+          if (prevBucketKey >= 0 && !uploadedBuckets.has(prevBucketKey) && buckets.has(prevBucketKey)) {
+            const prevBucket = buckets.get(prevBucketKey)!;
+            if (prevBucket.metrics.length > 0) {
+              // Upload the completed bucket IMMEDIATELY (happens during streaming)
+              await uploadMetricsBucket(executionId, prevBucketKey, prevBucket, token, apiUrl);
+              uploadedBuckets.add(prevBucketKey);
+            }
+          }
+
+          // Progress indicator
+          if (totalRequests % 50 === 0) {
+            console.log(chalk.gray(`   ✓ Processed ${totalRequests} metrics in real-time...`));
+          }
+        } catch (parseError) {
+          console.warn(chalk.yellow(`   ⚠️  Skipped unparseable line: ${line.substring(0, 50)}`));
+        }
+      }
+
+      // After stream ends, upload any remaining buckets that weren't uploaded yet
+      console.log(chalk.cyan(`\n📦 Uploading final metrics buckets...`));
+      const sortedBuckets = Array.from(buckets.entries())
+        .sort(([keyA], [keyB]) => keyA - keyB);
+
+      // Only upload buckets with valid keys (>= 0) that weren't already uploaded
+      for (const [bucketKey, bucketState] of sortedBuckets) {
+        if (bucketKey >= 0 && !uploadedBuckets.has(bucketKey) && bucketState.metrics.length > 0) {
+          await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
+          uploadedBuckets.add(bucketKey);
+        }
+      }
+
+      // Calculate final aggregated summary
+      const sortedLatencies = allLatencies.sort((a, b) => a - b);
+      const successRate = totalRequests > 0 ? successRequests / totalRequests : 0;
+
+      const results = {
+        executionId,
+        testId: tests[0].id || 'default-test',
+        avgLatency: totalRequests > 0 ? Math.round(sortedLatencies.reduce((a, b) => a + b, 0) / totalRequests) : 0,
+        minLatency: sortedLatencies.length > 0 ? Math.round(sortedLatencies[0]) : 0,
+        maxLatency: sortedLatencies.length > 0 ? Math.round(sortedLatencies[sortedLatencies.length - 1]) : 0,
+        p50Latency: Math.round(calculatePercentile(sortedLatencies, 0.5)),
+        p95Latency: Math.round(calculatePercentile(sortedLatencies, 0.95)),
+        p99Latency: Math.round(calculatePercentile(sortedLatencies, 0.99)),
+        successRate,
+        timestamp: new Date().toISOString(),
+        totalRequests,
+        testDuration: duration,
+        bytesIn: totalBytesIn,
+        bytesOut: totalBytesOut,
+        statusCodes: JSON.stringify(allStatusCodes),
+        errorDetails: JSON.stringify(Array.from(allErrorSet)),
+      };
+
+      console.log(chalk.cyan(`\n📊 Final Test Summary:`));
+      console.log(chalk.gray(`   Total Requests: ${totalRequests}`));
+      console.log(chalk.gray(`   Success Rate: ${(successRate * 100).toFixed(2)}%`));
+      console.log(chalk.gray(`   Avg Latency: ${(results.avgLatency / 1000000).toFixed(2)}ms`));
+      console.log(chalk.gray(`   P95 Latency: ${(results.p95Latency / 1000000).toFixed(2)}ms`));
+      console.log(chalk.gray(`   P99 Latency: ${(results.p99Latency / 1000000).toFixed(2)}ms`));
+      console.log(chalk.gray(`   Status Codes: ${JSON.stringify(allStatusCodes)}`));
+
+      // Create per-request metric summaries (grouped by URL)
+      const metricsByUrl: { [url: string]: RequestMetric[] } = {};
+      allMetrics.forEach((metric) => {
+        if (metric.url) {
+          if (!metricsByUrl[metric.url]) {
+            metricsByUrl[metric.url] = [];
+          }
+          metricsByUrl[metric.url].push(metric);
+        }
+      });
+
+      const requestMetricSummaries: RequestMetricSummary[] = Object.entries(metricsByUrl).map(([url, metrics], idx) => {
+        const latencies = metrics.map(m => m.latency).sort((a, b) => a - b);
+        const totalReqs = metrics.length;
+        const avgLat = latencies.reduce((a, b) => a + b, 0) / totalReqs;
+        const successCnt = metrics.filter(m => m.statusCode >= 200 && m.statusCode < 300).length;
+        const statusCodeMap: { [key: string]: number } = {};
+        const errorSet = new Set<string>();
+
+        metrics.forEach((m) => {
+          statusCodeMap[m.statusCode] = (statusCodeMap[m.statusCode] || 0) + 1;
+          if (m.error && m.error.trim()) {
+            errorSet.add(m.error);
+          }
+        });
+
+        return {
+          requestIndex: idx,
+          method: 'GET',
+          target: url,
+          totalRequests: totalReqs,
+          avgLatency: Math.round(avgLat),
+          minLatency: Math.round(latencies[0] || avgLat),
+          maxLatency: Math.round(latencies[totalReqs - 1] || avgLat),
+          p50Latency: Math.round(calculatePercentile(latencies, 0.5)),
+          p95Latency: Math.round(calculatePercentile(latencies, 0.95)),
+          p99Latency: Math.round(calculatePercentile(latencies, 0.99)),
+          successRate: successCnt / totalReqs,
+          bytesIn: metrics.reduce((sum, m) => sum + m.bytesIn, 0),
+          bytesOut: metrics.reduce((sum, m) => sum + m.bytesOut, 0),
+          statusCodes: statusCodeMap,
+          errors: Array.from(errorSet),
+        };
+      });
+
+      // Upload the final TestResult
+      console.log(chalk.cyan(`\n📊 Uploading final TestResult with aggregated metrics...`));
+      const resultCreated = await createTestResult(executionId, results.testId, results, token, apiUrl, requestMetricSummaries);
+      return resultCreated;
+    } catch (vegeteaError) {
+      console.error(chalk.red(`\n❌ Vegeta streaming failed:`));
+      console.error(chalk.red(`  Command: vegeta attack | vegeta encode -to json`));
+      console.error(chalk.red(`  Error: ${vegeteaError instanceof Error ? vegeteaError.message : String(vegeteaError)}`));
+      throw vegeteaError;
+    }
+  } finally {
+    try {
+      unlinkSync(tempFile);
+    } catch (e) {
+      // Ignore
+    }
   }
 }
 
@@ -216,12 +625,108 @@ async function createLoadTestExecution(
   }
 }
 
+async function ensureVegeta(): Promise<void> {
+  try {
+    const { stdout } = await execa('vegeta', ['version'], { timeout: 5000 });
+    console.log(chalk.green(`✅ Vegeta is available: ${stdout.trim().split('\n')[0]}`));
+    return;
+  } catch (error) {
+    console.log(chalk.yellow('⚠️  Vegeta not found in PATH, attempting to install...'));
+
+    const platform = process.platform;
+    const arch = process.arch;
+
+    let vegetaUrl: string;
+    if (platform === 'darwin') {
+      if (arch === 'arm64') {
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_arm64.tar.gz';
+      } else {
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_amd64.tar.gz';
+      }
+    } else {
+      throw new Error(`Unsupported platform: ${platform} ${arch}`);
+    }
+
+    try {
+      const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
+      const tempDir = `/tmp/vegeta-install-${uniqueId}`;
+      await execa('rm', ['-rf', tempDir]);
+      await execa('mkdir', ['-p', tempDir]);
+
+      const tarballPath = `${tempDir}/vegeta.tar.gz`;
+      console.log(chalk.gray(`  Downloading from: ${vegetaUrl}`));
+      
+      await execa('curl', ['-L', '-f', '-o', tarballPath, vegetaUrl], {
+        timeout: 60000
+      });
+
+      const stats = await fs.stat(tarballPath);
+      if (stats.size === 0) {
+        throw new Error('Downloaded file is empty');
+      }
+
+      console.log(chalk.gray(`  Extracting to: ${tempDir}`));
+      await execa('tar', ['-xzf', tarballPath, '-C', tempDir]);
+
+      const { stdout: lsOutput } = await execa('ls', ['-la', tempDir]);
+      console.log(chalk.gray(`  Contents of ${tempDir}:`));
+      lsOutput.split('\n').forEach(line => console.log(chalk.gray(`    ${line}`)));
+
+      let vegetaBinary: string | undefined;
+      try {
+        const { stdout: findOutput } = await execa('find', [tempDir, '-name', 'vegeta', '-type', 'f', '-executable']);
+        const lines = findOutput.trim().split('\n').filter(l => l.length > 0);
+        vegetaBinary = lines[0];
+        console.log(chalk.gray(`  Found vegeta binary at: ${vegetaBinary}`));
+      } catch (findError) {
+        console.log(chalk.gray(`  Find command failed, trying alternative method`));
+        vegetaBinary = `${tempDir}/vegeta`;
+        try {
+          await execa('test', ['-f', vegetaBinary]);
+        } catch {
+          try {
+            const { stdout: lsFiles } = await execa('find', [tempDir, '-type', 'f']);
+            const files = lsFiles.trim().split('\n');
+            vegetaBinary = files.find(f => f.includes('vegeta'));
+          } catch {
+            vegetaBinary = undefined;
+          }
+        }
+      }
+
+      if (!vegetaBinary) {
+        throw new Error('Could not find vegeta binary in downloaded archive.');
+      }
+
+      console.log(chalk.gray(`  Installing binary: ${vegetaBinary}`));
+
+      try {
+        await execa('sudo', ['mv', vegetaBinary, '/usr/local/bin/vegeta']);
+        await execa('sudo', ['chmod', '+x', '/usr/local/bin/vegeta']);
+        console.log(chalk.green('✅ Vegeta installed to /usr/local/bin'));
+      } catch (sudoError) {
+        const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
+        await execa('mkdir', ['-p', userBinDir]);
+        await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
+        await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
+        process.env.PATH = `${userBinDir}:${process.env.PATH}`;
+        console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
+        console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH'));
+      }
+
+      await execa('rm', ['-rf', tempDir]);
+      console.log(chalk.green('✅ Vegeta installed successfully'));
+    } catch (downloadError) {
+      console.error(chalk.red('❌ Failed to download Vegeta:'), downloadError instanceof Error ? downloadError.message : String(downloadError));
+      throw new Error('Vegeta is required. Install from: https://github.com/tsenart/vegeta/releases');
+    }
+  }
+}
+
 export async function executePlanCommand(planFile: string, options: RunOptions): Promise<void> {
   try {
-    // Handle wildcard patterns by expanding them
     let resolvedPlanFile = planFile;
     if (planFile.includes('*')) {
-      // If wildcard is provided, try to find matching files
       const dirname = path.dirname(path.resolve(planFile));
       const pattern = path.basename(planFile);
       const files = await fs.readdir(dirname);
@@ -229,22 +734,20 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
       const matches = files.filter(f => regex.test(f));
       
       if (matches.length === 0) {
-        throw new Error(`No execution plan files found matching pattern: ${planFile}\nMake sure the file is in ~/Downloads/ directory`);
+        throw new Error(`No execution plan files found matching pattern: ${planFile}`);
       }
       
       if (matches.length > 1) {
-        throw new Error(`Multiple execution plan files found matching pattern: ${planFile}\nPlease specify the exact file name or delete old execution plans.`);
+        throw new Error(`Multiple execution plan files found matching pattern: ${planFile}`);
       }
       
       resolvedPlanFile = path.join(dirname, matches[0]);
     }
 
-    // Read and parse the execution plan file
     console.log(chalk.cyan(`📋 Loading execution plan from: ${resolvedPlanFile}`));
     const planContent = await fs.readFile(path.resolve(resolvedPlanFile), "utf8");
     const plan: ExecutionPlanFile = JSON.parse(planContent);
 
-    // Validate the plan structure
     if (!plan.metadata || !plan.authentication || !plan.tests) {
       throw new Error("Invalid execution plan file structure");
     }
@@ -254,7 +757,6 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
       throw new Error("No authentication token found in execution plan");
     }
 
-    // Determine API URL
     let apiUrl: string;
     if (options.apiUrl) {
       apiUrl = options.apiUrl;
@@ -278,13 +780,11 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
     console.log(chalk.gray(`  API URL: ${apiUrl}`));
     console.log(chalk.gray(`  Token: ${token.substring(0, 20)}...${token.substring(token.length - 10)}`));
 
-    // Check if Vegeta is available, download if not
     await ensureVegeta();
 
-    // Get the LoadTestExecution ID from the execution plan file
     const executionId = plan.metadata.executionId;
     if (!executionId) {
-      throw new Error("No execution ID found in execution plan file. Please download a fresh execution plan from Test Executions.");
+      throw new Error("No execution ID in plan. Download fresh plan from Test Executions.");
     }
 
     console.log(chalk.cyan(`\n🚀 Starting load tests for execution: ${executionId}\n`));
@@ -296,830 +796,12 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
       console.log(chalk.green(`📊 Results have been added to your execution`));
       console.log(chalk.green(`🌐 View results at: https://apimetrics.ai`));
     } else {
-      console.log(chalk.yellow(`\n⚠️  Test result failed to upload. Please check the errors above.`));
+      console.log(chalk.yellow(`\n⚠️  Test result failed to upload.`));
       console.log(chalk.yellow(`🔗 Try running again or check your API connection.`));
     }
 
   } catch (error) {
     console.error(chalk.red("❌ Error:"), error instanceof Error ? error.message : String(error));
     process.exit(1);
-  }
-}
-
-async function runCombinedTests(
-  tests: ExecutionPlanFile['tests'],
-  token: string,
-  apiUrl: string,
-  planName: string,
-  executionId: string
-): Promise<boolean> {
-  console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test`));
-
-  let attackInput = '';
-  let totalRequestCount = 0;
-
-  // Collect all requests from all tests into a single attack input
-  for (const test of tests) {
-    if (test.requests && test.requests.length > 0) {
-      console.log(chalk.gray(`  • ${test.name}: ${test.requests.length} request(s)`));
-      for (const request of test.requests) {
-        // Vegeta format: METHOD URL followed by optional headers and body
-        // Each request ends with a blank line
-        attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
-        if (request.headers) {
-          for (const [key, value] of Object.entries(request.headers)) {
-            attackInput += `${key}: ${value}\n`;
-          }
-        }
-        // Add blank line after headers (before body if present)
-        attackInput += '\n';
-        if (request.body) {
-          attackInput += `${request.body}\n`;
-        }
-        totalRequestCount++;
-      }
-    } else if (test.method && test.target) {
-      console.log(chalk.gray(`  • ${test.name}: 1 request (legacy format)`));
-      attackInput += `${test.method.toUpperCase()} ${test.target}\n\n`;
-      totalRequestCount++;
-    }
-  }
-
-  // Show all requests in the cycle loop
-  console.log(chalk.cyan(`\n  📋 Requests in cycle loop (will repeat in order):`));
-  const requestLines = attackInput.trim().split('\n');
-  requestLines.forEach((line, index) => {
-    console.log(chalk.gray(`     ${index + 1}. ${line}`));
-  });
-
-  // Use settings from the first test (they should all be the same)
-  const firstTest = tests[0];
-  const rps = firstTest.rps;
-  const duration = firstTest.duration;
-
-  console.log(chalk.gray(`  Total requests to cycle through: ${totalRequestCount}`));
-  console.log(chalk.gray(`  RPS: ${rps}, Duration: ${duration}`));
-  console.log("");
-
-  // Run vegeta attack with combined requests using a temporary file
-  const tempDir = os.tmpdir();
-  const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
-  const tempFile = path.join(tempDir, `vegeta-requests-${uniqueId}.txt`);
-  const resultsFile = path.join(tempDir, `vegeta-results-${uniqueId}.bin`);
-
-  try {
-    // Write requests to temporary file (ensure there's a final newline)
-    const fileContent = attackInput.trim() + '\n';
-    writeFileSync(tempFile, fileContent, 'utf8');
-
-    // Debug: Show file content
-    console.log(chalk.gray(`\n  📝 Vegeta input file: ${tempFile}`));
-    console.log(chalk.gray(`  📊 File size: ${fileContent.length} bytes`));
-    console.log(chalk.gray(`\n  📋 Request format preview:`));
-    const preview = fileContent.trim().split('\n').slice(0, 10);
-    preview.forEach(line => {
-      console.log(chalk.gray(`     ${line}`));
-    });
-    if (fileContent.trim().split('\n').length > 10) {
-      console.log(chalk.gray(`     ... (${fileContent.trim().split('\n').length - 10} more lines)`));
-    }
-
-    // Run vegeta attack using the file with separate processes (not piped) to avoid resource issues
-    // First, run attack and save results to binary file
-    try {
-      // Use execSync to run vegeta with file redirection (more reliable than pipes)
-      const cmd = `cat "${tempFile}" | /opt/homebrew/bin/vegeta attack -rate=${rps} -duration=${duration} -timeout=30s > "${resultsFile}"`;
-      execSync(cmd, { stdio: 'inherit', shell: '/bin/bash' });
-    } catch (vegeteaError) {
-      console.error(chalk.red(`\n❌ Vegeta attack failed:`));
-      console.error(chalk.red(`  Command: vegeta attack -rate=${rps} -duration=${duration}`));
-      console.error(chalk.red(`  Error: ${vegeteaError instanceof Error ? vegeteaError.message : String(vegeteaError)}`));
-
-      // Try to read the input file to debug
-      try {
-        const content = await fs.readFile(tempFile, 'utf8');
-        console.error(chalk.red(`\n  Input file content (first 500 chars):`));
-        console.error(chalk.red(`  ${content.substring(0, 500)}`));
-      } catch (e) {
-        // ignore
-      }
-
-      throw vegeteaError;
-    }
-
-    // Then read the binary results and generate report
-    try {
-      const result = execSync(`/opt/homebrew/bin/vegeta report -type=json < "${resultsFile}"`, { encoding: 'utf8', shell: '/bin/bash' });
-      const stdout = result;
-
-      // Parse the JSON output
-      const report = JSON.parse(stdout);
-
-      console.log(chalk.green(`  ✅ Combined load test completed`));
-      console.log(chalk.gray(`     Total Requests: ${report.requests || 0}`));
-      console.log(chalk.gray(`     Duration: ${report.duration || 'N/A'}`));
-      console.log(chalk.gray(`     Rate: ${report.rate || 'N/A'} RPS`));
-      console.log(chalk.gray(`     Throughput: ${report.throughput || 'N/A'} req/sec`));
-      console.log(chalk.gray(`     Success Rate: ${(report.success * 100 || 0).toFixed(2)}%`));
-
-      // Extract detailed metrics
-      const latencies = report.latencies || {};
-      const statusCodes = report.status_codes || {};
-      const errors = report.errors || [];
-
-      console.log(chalk.cyan(`\n     📊 Detailed Metrics:`));
-
-      // Latency metrics
-      console.log(chalk.gray(`     Response Times:`));
-      console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • Min:  ${(latencies.min / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • Max:  ${(latencies.max / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P50:  ${(latencies["50th"] / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P95:  ${(latencies["95th"] / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P99:  ${(latencies["99th"] / 1000000 || 0).toFixed(2)}ms`));
-
-      // Data transfer
-      if (report.bytes_in || report.bytes_out) {
-        console.log(chalk.gray(`     Data Transfer:`));
-        if (report.bytes_in) {
-          console.log(chalk.gray(`       • Bytes In:  ${report.bytes_in.total || 0} total, ${(report.bytes_in.mean || 0).toFixed(0)} avg`));
-        }
-        if (report.bytes_out) {
-          console.log(chalk.gray(`       • Bytes Out: ${report.bytes_out.total || 0} total, ${(report.bytes_out.mean || 0).toFixed(0)} avg`));
-        }
-      }
-
-      // Status codes breakdown
-      if (Object.keys(statusCodes).length > 0) {
-        console.log(chalk.gray(`     Status Codes:`));
-        Object.entries(statusCodes).forEach(([code, count]) => {
-          const statusColor = parseInt(code) >= 200 && parseInt(code) < 300 ? chalk.green :
-                             parseInt(code) >= 400 && parseInt(code) < 500 ? chalk.yellow :
-                             parseInt(code) >= 500 ? chalk.red : chalk.gray;
-          console.log(statusColor(`       • ${code}: ${count}`));
-        });
-      }
-
-      // Errors
-      if (errors.length > 0) {
-        console.log(chalk.red(`     Errors (${errors.length}):`));
-        errors.slice(0, 5).forEach((error: string) => {
-          console.log(chalk.red(`       • ${error}`));
-        });
-        if (errors.length > 5) {
-          console.log(chalk.red(`       • ... and ${errors.length - 5} more`));
-        }
-      }
-
-      // Calculate success rate for upload
-      const totalRequests = report.requests || 1;
-      const successRequests = Object.entries(statusCodes)
-        .filter(([code]) => parseInt(code) >= 200 && parseInt(code) < 300)
-        .reduce((sum, [, count]) => sum + (count as number), 0);
-      const successRate = successRequests / totalRequests;
-
-      // Prepare results for upload - use the newly created execution ID
-      const results = {
-        executionId: executionId,
-        avgLatency: Math.round(latencies.mean || 0),
-        p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
-        successRate: successRate,
-        timestamp: new Date().toISOString(),
-        minLatency: Math.round(latencies.min || 0),
-        maxLatency: Math.round(latencies.max || 0),
-        p50Latency: Math.round(latencies["50th"] || latencies.mean || 0),
-        p99Latency: Math.round(latencies["99th"] || latencies.mean || 0),
-        totalRequests: totalRequests,
-        testDuration: duration,
-        actualRate: report.rate,
-        throughput: report.throughput,
-        bytesIn: report.bytes_in?.total,
-        bytesOut: report.bytes_out?.total,
-        statusCodes: JSON.stringify(statusCodes),
-        errorDetails: JSON.stringify(errors),
-      };
-
-      console.log(chalk.cyan(`\n� Prepared results object:`));
-      console.log(chalk.gray(`  executionId: ${results.executionId}`));
-      console.log(chalk.gray(`  avgLatency: ${results.avgLatency} (type: ${typeof results.avgLatency})`));
-      console.log(chalk.gray(`  p95Latency: ${results.p95Latency} (type: ${typeof results.p95Latency})`));
-      console.log(chalk.gray(`  successRate: ${results.successRate} (type: ${typeof results.successRate})`));
-      console.log(chalk.gray(`  timestamp: ${results.timestamp}`));
-      console.log(chalk.gray(`  requests: ${results.totalRequests} (type: ${typeof results.totalRequests})`));
-
-      // Extract per-request metrics before creating test result
-      let requestMetrics: RequestMetric[] = [];
-      try {
-        requestMetrics = await extractPerRequestMetrics(resultsFile);
-      } catch (metricsError) {
-        console.warn(chalk.yellow(`⚠️  Failed to extract per-request metrics: ${metricsError instanceof Error ? metricsError.message : String(metricsError)}`));
-        // Continue without per-request metrics - not critical
-      }
-
-      // Group metrics by request type and create aggregated summaries
-      let requestMetricSummaries: RequestMetricSummary[] = [];
-      console.log(chalk.gray(`\n   📊 Debug: requestMetrics.length = ${requestMetrics.length}`));
-      if (requestMetrics.length > 0) {
-        console.log(chalk.cyan(`\n📊 Aggregating metrics by request type...`));
-
-        // Build request list in the same order as they appear in the attack input
-        const requestList: Array<{ method: string; target: string; index: number }> = [];
-        let currentIndex = 0;
-
-        for (const test of tests) {
-          if (test.requests && test.requests.length > 0) {
-            for (const request of test.requests) {
-              requestList.push({
-                method: request.method.toUpperCase(),
-                target: request.target,
-                index: currentIndex++
-              });
-            }
-          } else if (test.method && test.target) {
-            requestList.push({
-              method: test.method.toUpperCase(),
-              target: test.target,
-              index: currentIndex++
-            });
-          }
-        }
-
-        // Group metrics by the actual URL that was requested (from Vegeta output)
-        const metricsByUrl: { [url: string]: RequestMetric[] } = {};
-        
-        requestMetrics.forEach((metric) => {
-          if (metric.url) {
-            if (!metricsByUrl[metric.url]) {
-              metricsByUrl[metric.url] = [];
-            }
-            metricsByUrl[metric.url].push(metric);
-          }
-        });
-
-        // Create aggregated summaries for each unique URL
-        requestMetricSummaries = Object.entries(metricsByUrl).map(([url, metrics], idx) => {
-          // Find the matching request to get method
-          const matchingRequest = requestList.find(r => r.target === url);
-          const method = matchingRequest?.method || 'UNKNOWN';
-
-          // Calculate aggregated statistics
-          const latencies = metrics.map(m => m.latency).sort((a, b) => a - b);
-          const totalRequests = metrics.length;
-          const avgLatency = latencies.reduce((a, b) => a + b, 0) / totalRequests;
-          const minLatency = Math.min(...latencies);
-          const maxLatency = Math.max(...latencies);
-          const p50Index = Math.floor(totalRequests * 0.5);
-          const p95Index = Math.floor(totalRequests * 0.95);
-          const p99Index = Math.floor(totalRequests * 0.99);
-
-          const successCount = metrics.filter(m => m.statusCode >= 200 && m.statusCode < 300).length;
-          const successRate = successCount / totalRequests;
-
-          const statusCodes: { [key: string]: number } = {};
-          const errors: string[] = [];
-          const errorSet = new Set<string>(); // Track unique errors per URL
-
-          metrics.forEach((m) => {
-            statusCodes[m.statusCode] = (statusCodes[m.statusCode] || 0) + 1;
-            // Only include errors that actually occurred for this URL
-            if (m.error && m.error.trim() && !errorSet.has(m.error)) {
-              errorSet.add(m.error);
-              errors.push(m.error);
-            }
-          });
-
-          const bytesIn = metrics.reduce((sum, m) => sum + m.bytesIn, 0);
-          const bytesOut = metrics.reduce((sum, m) => sum + m.bytesOut, 0);
-
-          return {
-            requestIndex: idx,
-            method,
-            target: url,
-            totalRequests,
-            avgLatency: Math.round(avgLatency),
-            minLatency: Math.round(minLatency),
-            maxLatency: Math.round(maxLatency),
-            p50Latency: Math.round(latencies[p50Index] || avgLatency),
-            p95Latency: Math.round(latencies[p95Index] || avgLatency),
-            p99Latency: Math.round(latencies[p99Index] || avgLatency),
-            successRate,
-            bytesIn,
-            bytesOut,
-            statusCodes,
-            errors,
-          };
-        });
-
-        console.log(chalk.green(`   ✅ Created ${requestMetricSummaries.length} aggregated summaries`));
-        requestMetricSummaries.forEach((summary, idx) => {
-          console.log(chalk.gray(`     ${idx + 1}. ${summary.method} ${summary.target}: ${summary.totalRequests} reqs, ${(summary.successRate * 100).toFixed(1)}% success`));
-        });
-      }
-
-      // Create test result in the execution
-      const testId = tests[0].id || 'default-test';
-      const resultCreated = await createTestResult(executionId, testId, results, token, apiUrl, requestMetricSummaries);
-      return resultCreated;
-    } catch (reportError) {
-      console.error(chalk.red(`\n❌ Report generation failed:`));
-      console.error(chalk.red(`  Error: ${reportError instanceof Error ? reportError.message : String(reportError)}`));
-      throw reportError;
-    }
-  } finally {
-    // Clean up temporary files
-    try {
-      unlinkSync(tempFile);
-    } catch (e) {
-      // Ignore errors cleaning up temp file
-    }
-    try {
-      unlinkSync(resultsFile);
-    } catch (e) {
-      // Ignore errors cleaning up results file
-    }
-  }
-}
-
-async function runTest(
-  test: ExecutionPlanFile['tests'][0],
-  token: string,
-  apiUrl: string,
-  index: number,
-  total: number
-): Promise<boolean> {
-  console.log(chalk.blue(`\n[${index}/${total}] ${test.name}`));
-  
-  let attackInput = '';
-  let requestCount = 0;
-  
-  if (test.requests && test.requests.length > 0) {
-    // New format: cycle through all requests
-    console.log(chalk.gray(`  Cycling through ${test.requests.length} request(s) in order`));
-    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
-    
-    // Generate attack input with all requests in order - Vegeta will cycle through them
-    for (const request of test.requests) {
-      // Vegeta format: METHOD URL followed by optional headers and body
-      // Each request ends with a blank line
-      attackInput += `${request.method.toUpperCase()} ${request.target}\n`;
-      if (request.headers) {
-        for (const [key, value] of Object.entries(request.headers)) {
-          attackInput += `${key}: ${value}\n`;
-        }
-      }
-      // Add blank line after headers (before body if present)
-      attackInput += '\n';
-      if (request.body) {
-        attackInput += `${request.body}\n`;
-      }
-      requestCount++;
-    }
-  } else if (test.method && test.target) {
-    // Legacy format: single request
-    console.log(chalk.gray(`  ${test.method} ${test.target}`));
-    console.log(chalk.gray(`  RPS: ${test.rps}, Duration: ${test.duration}`));
-    console.log(chalk.gray(`  Description: ${test.description || 'N/A'}`));
-    
-    attackInput = `${test.method.toUpperCase()} ${test.target}\n\n`;
-    requestCount = 1;
-  } else {
-    throw new Error('Test must have either requests array or method/target');
-  }
-  
-  console.log(chalk.gray(`  Total requests in sequence: ${requestCount}`));
-  console.log("");
-
-  // Run vegeta attack and save results to binary file
-  const tempDir = os.tmpdir();
-  const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
-  const tempFile = path.join(tempDir, `vegeta-requests-${uniqueId}.txt`);
-  const resultsFile = path.join(tempDir, `vegeta-results-${uniqueId}.bin`);
-  
-  try {
-    // Write requests to temporary file (ensure there's a final newline)
-    const fileContent = attackInput.trim() + '\n';
-    writeFileSync(tempFile, fileContent, 'utf8');
-    
-    // Debug: Show file content
-    console.log(chalk.gray(`\n  📝 Vegeta input file: ${tempFile}`));
-    console.log(chalk.gray(`  📊 File size: ${fileContent.length} bytes`));
-    
-    // Run vegeta attack using the file with separate processes (not piped) to avoid resource issues
-    // First, run attack and save results to binary file using stdin redirection instead of pipe
-    try {
-      await execa(
-          'sh',
-          ['-c', `vegeta attack -rate=${test.rps} -duration=${test.duration} -timeout=30s < "${tempFile}" > "${resultsFile}"`],
-          {
-            timeout: 600000 // 10 minutes timeout
-          }
-        );
-    } catch (vegeteaError) {
-      console.error(chalk.red(`\n❌ Vegeta attack failed:`));
-      console.error(chalk.red(`  Command: vegeta attack -rate=${test.rps} -duration=${test.duration}`));
-      console.error(chalk.red(`  Error: ${vegeteaError instanceof Error ? vegeteaError.message : String(vegeteaError)}`));
-      
-      // Try to read the input file to debug
-      try {
-        const content = await fs.readFile(tempFile, 'utf8');
-        console.error(chalk.red(`\n  Input file content (first 500 chars):`));
-        console.error(chalk.red(`  ${content.substring(0, 500)}`));
-      } catch (e) {
-        // ignore
-      }
-      
-      throw vegeteaError;
-    }
-    
-    // Then read the binary results and generate report
-    try {
-      const result = execSync(`/opt/homebrew/bin/vegeta report -type=json < "${resultsFile}"`, { encoding: 'utf8', shell: '/bin/bash' });
-      const stdout = result;
-
-      // Parse the JSON output
-      const report = JSON.parse(stdout);
-
-      console.log(chalk.green(`  ✅ Load test completed`));
-      console.log(chalk.gray(`     Requests: ${report.requests || 0}`));
-      console.log(chalk.gray(`     Duration: ${report.duration || 'N/A'}`));
-      console.log(chalk.gray(`     Rate: ${report.rate || 'N/A'} RPS`));
-      console.log(chalk.gray(`     Throughput: ${report.throughput || 'N/A'} req/sec`));
-      console.log(chalk.gray(`     Success Rate: ${(report.success * 100 || 0).toFixed(2)}%`));
-
-      // Extract detailed metrics
-      const latencies = report.latencies || {};
-      const statusCodes = report.status_codes || {};
-      const errors = report.errors || [];
-
-      console.log(chalk.cyan(`\n     📊 Detailed Metrics:`));
-      
-      // Latency metrics
-      console.log(chalk.gray(`     Response Times:`));
-      console.log(chalk.gray(`       • Mean: ${(latencies.mean / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • Min:  ${(latencies.min / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • Max:  ${(latencies.max / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P50:  ${(latencies["50th"] / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P95:  ${(latencies["95th"] / 1000000 || 0).toFixed(2)}ms`));
-      console.log(chalk.gray(`       • P99:  ${(latencies["99th"] / 1000000 || 0).toFixed(2)}ms`));
-
-      // Data transfer
-      if (report.bytes_in || report.bytes_out) {
-        console.log(chalk.gray(`     Data Transfer:`));
-        if (report.bytes_in) {
-          console.log(chalk.gray(`       • Bytes In:  ${report.bytes_in.total || 0} total, ${(report.bytes_in.mean || 0).toFixed(0)} avg`));
-        }
-        if (report.bytes_out) {
-          console.log(chalk.gray(`       • Bytes Out: ${report.bytes_out.total || 0} total, ${(report.bytes_out.mean || 0).toFixed(0)} avg`));
-        }
-      }
-
-      // Status codes breakdown
-      if (Object.keys(statusCodes).length > 0) {
-        console.log(chalk.gray(`     Status Codes:`));
-        Object.entries(statusCodes).forEach(([code, count]) => {
-          const statusColor = parseInt(code) >= 200 && parseInt(code) < 300 ? chalk.green :
-                             parseInt(code) >= 400 && parseInt(code) < 500 ? chalk.yellow :
-                             parseInt(code) >= 500 ? chalk.red : chalk.gray;
-          console.log(statusColor(`       • ${code}: ${count}`));
-        });
-      }
-
-      // Errors
-      if (errors.length > 0) {
-        console.log(chalk.red(`     Errors (${errors.length}):`));
-        errors.slice(0, 5).forEach((error: string) => {
-          console.log(chalk.red(`       • ${error}`));
-        });
-        if (errors.length > 5) {
-          console.log(chalk.red(`       • ... and ${errors.length - 5} more`));
-        }
-      }
-
-      // Calculate success rate for upload
-      const totalRequests = report.requests || 1;
-      const successRequests = Object.entries(statusCodes)
-        .filter(([code]) => parseInt(code) >= 200 && parseInt(code) < 300)
-        .reduce((sum, [, count]) => sum + (count as number), 0);
-      const successRate = successRequests / totalRequests;
-
-      // Prepare results for upload
-      const results = {
-        executionId: test.id,
-        avgLatency: Math.round(latencies.mean || 0),
-        p95Latency: Math.round(latencies["95th"] || latencies.mean || 0),
-        successRate: successRate,
-        timestamp: new Date().toISOString(),
-        // Detailed metrics
-        minLatency: Math.round(latencies.min || 0),
-        maxLatency: Math.round(latencies.max || 0),
-        p50Latency: Math.round(latencies["50th"] || 0),
-        p99Latency: Math.round(latencies["99th"] || 0),
-        requests: report.requests,
-        duration: typeof report.duration === 'string' ? report.duration : `${(Number(report.duration) / 1000000000).toFixed(2)}s`,
-        rate: report.rate,
-        throughput: report.throughput,
-        bytesIn: report.bytes_in?.total,
-        bytesOut: report.bytes_out?.total,
-        statusCodes: statusCodes,
-        errors: errors,
-      };
-
-      // Extract per-request metrics before uploading
-      let requestMetrics: RequestMetric[] = [];
-      let requestMetricSummaries: RequestMetricSummary[] = [];
-      // Note: Using aggregated approach now - individual metrics extraction removed
-      // try {
-      //   requestMetrics = await extractPerRequestMetrics(resultsFile);
-      // } catch (metricsError) {
-      //   console.warn(chalk.yellow(`⚠️  Failed to extract per-request metrics: ${metricsError instanceof Error ? metricsError.message : String(metricsError)}`));
-      //   // Continue without per-request metrics - not critical
-      // }
-
-      // Upload results
-      const uploadSuccess = await uploadResults(results, token, apiUrl, test.name, requestMetricSummaries);
-      return uploadSuccess;
-    } catch (reportError) {
-      console.error(chalk.red(`\n❌ Report generation failed:`));
-      console.error(chalk.red(`  Error: ${reportError instanceof Error ? reportError.message : String(reportError)}`));
-      throw reportError;
-    }
-  } finally {
-    // Clean up temporary files
-    try {
-      unlinkSync(tempFile);
-    } catch (e) {
-      // Ignore errors cleaning up temp file
-    }
-    try {
-      unlinkSync(resultsFile);
-    } catch (e) {
-      // Ignore errors cleaning up results file
-    }
-  }
-}
-
-async function createTestResult(
-  executionId: string,
-  testId: string,
-  results: any,
-  token: string,
-  apiUrl: string,
-  requestMetrics?: RequestMetricSummary[]
-): Promise<boolean> {
-  try {
-    console.log(chalk.cyan('\n📤 Creating test result...'));
-    
-    const resultData = {
-      testId: testId,
-      avgLatency: results.avgLatency,
-      p95Latency: results.p95Latency,
-      successRate: results.successRate,
-      timestamp: results.timestamp,
-      minLatency: results.minLatency,
-      maxLatency: results.maxLatency,
-      p50Latency: results.p50Latency,
-      p99Latency: results.p99Latency,
-      totalRequests: results.requests,
-      testDuration: results.duration,
-      actualRate: results.rate,
-      throughput: results.throughput,
-      bytesIn: results.bytesIn,
-      bytesOut: results.bytesOut,
-      statusCodes: results.statusCodes,  // Already stringified in results object
-      errorDetails: results.errorDetails,  // Already stringified in results object (JSON string)
-      requestMetrics: requestMetrics || [],
-    };
-    
-    // Log the metrics being sent
-    console.log(chalk.gray(`\n   📊 Test Result Summary:`));
-    console.log(chalk.gray(`      - Execution ID: ${executionId}`));
-    console.log(chalk.gray(`      - Test ID: ${testId}`));
-    console.log(chalk.gray(`      - Total Requests: ${resultData.totalRequests}`));
-    console.log(chalk.gray(`      - Avg Latency: ${(resultData.avgLatency / 1000000).toFixed(2)}ms`));
-    console.log(chalk.gray(`      - Success Rate: ${(resultData.successRate * 100).toFixed(2)}%`));
-    
-    // Log request metrics being sent
-    console.log(chalk.cyan(`\n   📋 Request Metrics Debug:`));
-    console.log(chalk.gray(`      - Type: ${typeof requestMetrics}`));
-    console.log(chalk.gray(`      - Is Array: ${Array.isArray(requestMetrics)}`));
-    console.log(chalk.gray(`      - Length: ${requestMetrics?.length ?? 'undefined'}`));
-    
-    if (requestMetrics && requestMetrics.length > 0) {
-      console.log(chalk.cyan(`\n   📋 Per-Request Metrics being sent:`));
-      console.log(chalk.gray(`      - Count: ${requestMetrics.length} aggregated metrics`));
-      console.log(chalk.gray(`      - Sample metrics (first 3):`));
-      requestMetrics.slice(0, 3).forEach((metric, idx) => {
-        console.log(chalk.gray(`        ${idx + 1}. ${metric.method} ${metric.target}: ${metric.totalRequests} reqs, ${(metric.successRate * 100).toFixed(1)}% success, Avg: ${(metric.avgLatency / 1000000).toFixed(2)}ms, P95: ${(metric.p95Latency / 1000000).toFixed(2)}ms`));
-      });
-      if (requestMetrics.length > 3) {
-        console.log(chalk.gray(`        ... and ${requestMetrics.length - 3} more`));
-      }
-      console.log(chalk.gray(`\n   Full payload being sent:`));
-      console.log(chalk.gray(JSON.stringify(resultData, null, 2)));
-    } else {
-      console.log(chalk.yellow(`\n   ⚠️  No request metrics to send (requestMetrics is ${requestMetrics ? 'empty' : 'undefined'})`));
-      console.log(chalk.gray(`\n   Full payload being sent:`));
-      console.log(chalk.gray(JSON.stringify(resultData, null, 2)));
-    }
-    
-    console.log(chalk.gray(`\n   🔗 Posting to: ${apiUrl}/loadtestsexecutions/${executionId}/loadtests`));
-    
-    const response = await axios.post(
-      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
-      resultData,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        timeout: 10000,
-      }
-    );
-
-    console.log(chalk.green(`\n   ✅ Test result created successfully`));
-    console.log(chalk.gray(`      Response: ${response.status} ${response.statusText}`));
-    console.log(chalk.gray(`      Test Result ID: ${response.data.id}`));
-    return true;
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      console.error(chalk.red(`\n   ⚠️  Result creation error:`), error.message);
-      if (error.response) {
-        console.error(chalk.red(`      Response Status: ${error.response.status} ${error.response.statusText}`));
-        console.error(chalk.red(`      Response Data:`, JSON.stringify(error.response.data, null, 2)));
-      }
-    } else {
-      console.error(chalk.red(`\n   ⚠️  Unexpected error:`, error instanceof Error ? error.message : String(error)));
-    }
-    return false;
-  }
-}
-
-async function uploadResults(
-  results: any,
-  token: string,
-  apiUrl: string,
-  testName: string,
-  requestMetricSummaries?: RequestMetricSummary[],
-  executionId?: string
-): Promise<boolean> {
-  try {
-    console.log(chalk.cyan('\n📤 Uploading results...'));
-    console.log(chalk.gray('  Request data being sent:'));
-    console.log(chalk.gray(JSON.stringify(results, null, 2)));
-    
-    // Add request metrics to the payload if available
-    const payload = {
-      ...results,
-      requestMetrics: requestMetricSummaries || []
-    };
-    
-    if (requestMetricSummaries && requestMetricSummaries.length > 0) {
-      console.log(chalk.gray(`  Including ${requestMetricSummaries.length} per-request metrics`));
-    }
-    
-    const response = await axios.post(
-      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        timeout: 30000, // Increased from 5000ms to 30000ms (30 seconds)
-      }
-    );
-
-    console.log(chalk.green(`  📊 Results uploaded successfully`));
-    console.log(chalk.gray(`  Response: ${response.status} ${response.statusText}`));
-    return true;
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      console.error(chalk.red(`  ⚠️  Upload Error:`), error.message);
-      if (error.response) {
-        console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
-        console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
-      } else if (error.request) {
-        console.error(chalk.red(`     No response received from server`));
-        console.error(chalk.red(`     Request details:`, error.request));
-      }
-    } else {
-      console.error(chalk.red(`  ⚠️  Upload Error:`), error instanceof Error ? error.message : String(error));
-      if (error instanceof Error) {
-        console.error(chalk.red(`     Stack:`, error.stack));
-      }
-    }
-    // Don't throw - continue with other tests
-    return false;
-  }
-}
-
-async function ensureVegeta(): Promise<void> {
-  try {
-    // Check if vegeta is available - quick check
-    const { stdout } = await execa('vegeta', ['version'], { timeout: 5000 });
-    console.log(chalk.green(`✅ Vegeta is available: ${stdout.trim().split('\n')[0]}`));
-    return; // Vegeta is available, no need to install
-  } catch (error) {
-    console.log(chalk.yellow('⚠️  Vegeta not found in PATH, attempting to install...'));
-
-    // Determine platform
-    const platform = process.platform;
-    const arch = process.arch;
-
-    let vegetaUrl: string;
-    if (platform === 'darwin') {
-      if (arch === 'arm64') {
-        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_arm64.tar.gz';
-      } else {
-        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_amd64.tar.gz';
-      }
-    } else {
-      throw new Error(`Unsupported platform: ${platform} ${arch}`);
-    }
-
-    try {
-      // Download and extract vegeta with unique temp directory per process
-      const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
-      const tempDir = `/tmp/vegeta-install-${uniqueId}`;
-      await execa('rm', ['-rf', tempDir]);
-      await execa('mkdir', ['-p', tempDir]);
-
-      const tarballPath = `${tempDir}/vegeta.tar.gz`;
-      console.log(chalk.gray(`  Downloading from: ${vegetaUrl}`));
-      
-      // Use curl with better options
-      await execa('curl', ['-L', '-f', '-o', tarballPath, vegetaUrl], {
-        timeout: 60000 // 1 minute timeout
-      });
-
-      // Verify the file was downloaded
-      const stats = await fs.stat(tarballPath);
-      if (stats.size === 0) {
-        throw new Error('Downloaded file is empty');
-      }
-
-      console.log(chalk.gray(`  Extracting to: ${tempDir}`));
-      await execa('tar', ['-xzf', tarballPath, '-C', tempDir]);
-
-      // List directory to debug
-      const { stdout: lsOutput } = await execa('ls', ['-la', tempDir]);
-      console.log(chalk.gray(`  Contents of ${tempDir}:`));
-      lsOutput.split('\n').forEach(line => console.log(chalk.gray(`    ${line}`)));
-
-      // Find the vegeta binary (may be in subdirectory)
-      let vegetaBinary: string | undefined;
-      try {
-        const { stdout: findOutput } = await execa('find', [tempDir, '-name', 'vegeta', '-type', 'f', '-executable']);
-        const lines = findOutput.trim().split('\n').filter(l => l.length > 0);
-        vegetaBinary = lines[0];
-        console.log(chalk.gray(`  Found vegeta binary at: ${vegetaBinary}`));
-      } catch (findError) {
-        console.log(chalk.gray(`  Find command failed, trying alternative method`));
-        // Try checking if vegeta is directly in tempDir
-        vegetaBinary = `${tempDir}/vegeta`;
-        try {
-          await execa('test', ['-f', vegetaBinary]);
-        } catch {
-          // Not in root, maybe in a subdirectory
-          try {
-            const { stdout: lsFiles } = await execa('find', [tempDir, '-type', 'f']);
-            const files = lsFiles.trim().split('\n');
-            vegetaBinary = files.find(f => f.includes('vegeta'));
-          } catch {
-            vegetaBinary = undefined;
-          }
-        }
-      }
-
-      if (!vegetaBinary) {
-        throw new Error('Could not find vegeta binary in downloaded archive. Check directory contents above.');
-      }
-
-      console.log(chalk.gray(`  Installing binary: ${vegetaBinary}`));
-
-      // Move to /usr/local/bin (may require sudo)
-      try {
-        await execa('sudo', ['mv', vegetaBinary, '/usr/local/bin/vegeta']);
-        await execa('sudo', ['chmod', '+x', '/usr/local/bin/vegeta']);
-        console.log(chalk.green('✅ Vegeta installed to /usr/local/bin'));
-      } catch (sudoError) {
-        // Try to install to user directory
-        const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
-        await execa('mkdir', ['-p', userBinDir]);
-        await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
-        await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
-
-        // Add to PATH for this session
-        process.env.PATH = `${userBinDir}:${process.env.PATH}`;
-        console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
-        console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH in your shell config'));
-      }
-
-      // Cleanup
-      await execa('rm', ['-rf', tempDir]);
-
-      console.log(chalk.green('✅ Vegeta installed successfully'));
-    } catch (downloadError) {
-      console.error(chalk.red('❌ Failed to download Vegeta:'), downloadError instanceof Error ? downloadError.message : String(downloadError));
-      throw new Error('Vegeta is required for load testing. Please install it manually: https://github.com/tsenart/vegeta/releases');
-    }
   }
 }
