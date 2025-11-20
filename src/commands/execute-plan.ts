@@ -145,8 +145,13 @@ async function uploadMetricsBucket(
     const sortedLatencies = bucketState.latencies.sort((a, b) => a - b);
     const totalRequests = bucketState.metrics.length;
     const avgLatency = sortedLatencies.reduce((a, b) => a + b, 0) / totalRequests;
-    const minLatency = Math.min(...sortedLatencies);
-    const maxLatency = Math.max(...sortedLatencies);
+    const minLatency = sortedLatencies.length > 0 ? Math.min(...sortedLatencies) : 0;
+    const maxLatency = sortedLatencies.length > 0 ? Math.max(...sortedLatencies) : 0;
+    
+    // Debug logging
+    console.log(chalk.gray(`      DEBUG: sortedLatencies.length = ${sortedLatencies.length}`));
+    console.log(chalk.gray(`      DEBUG: minLatency (ns) = ${minLatency}, maxLatency (ns) = ${maxLatency}`));
+    console.log(chalk.gray(`      DEBUG: minLatency (ms) = ${Math.round(minLatency / 1000000)}, maxLatency (ms) = ${Math.round(maxLatency / 1000000)}`));
 
     const bucketData = {
       testResultId,
@@ -157,7 +162,7 @@ async function uploadMetricsBucket(
       successCount: bucketState.successCount,
       failureCount: bucketState.failureCount,
       avgLatency: Math.round(avgLatency / 1000000), // Convert nanoseconds to milliseconds
-      minLatency: Math.round(minLatency / 1000000), // Convert nanoseconds to milliseconds
+      minLatency: minLatency > 0 ? Math.max(1, Math.round(minLatency / 1000000)) : 0, // Min 1ms if non-zero
       maxLatency: Math.round(maxLatency / 1000000), // Convert nanoseconds to milliseconds
       p50Latency: Math.round(calculatePercentile(sortedLatencies, 0.5) / 1000000), // Convert nanoseconds to milliseconds
       p95Latency: Math.round(calculatePercentile(sortedLatencies, 0.95) / 1000000), // Convert nanoseconds to milliseconds
@@ -233,10 +238,16 @@ async function createInitialTestResult(
     if (axios.isAxiosError(error)) {
       console.error(chalk.red(`❌ Failed to create TestResult:`), error.message);
       if (error.response) {
+        console.error(chalk.red(`Status:`, error.response.status));
         console.error(chalk.red(`Response:`, JSON.stringify(error.response.data, null, 2)));
       }
+      if (error.request && !error.response) {
+        console.error(chalk.red(`No response received. Request was made but no response.`));
+      }
+      console.error(chalk.red(`Full error:`, error));
     } else {
       console.error(chalk.red(`❌ Unexpected error:`, error instanceof Error ? error.message : String(error)));
+      console.error(chalk.red(`Full error:`, error));
     }
     return null;
   }
@@ -443,7 +454,11 @@ async function runCombinedTests(
 
           totalBytesIn += bytesIn;
           totalBytesOut += bytesOut;
-          allLatencies.push(latency);
+          
+          // Only include non-zero latencies (Vegeta returns 0 for failed requests)
+          if (latency > 0) {
+            allLatencies.push(latency);
+          }
 
           // Initialize first metric time
           if (firstMetricTime === null) {
@@ -493,7 +508,12 @@ async function runCombinedTests(
           
           bucket.metrics.push(metric);
           bucket.totalRequests++;
-          bucket.latencies.push(latency);
+          
+          // Only include non-zero latencies (Vegeta returns 0 for failed requests)
+          if (latency > 0) {
+            bucket.latencies.push(latency);
+          }
+          
           bucket.bytesIn += bytesIn;
           bucket.bytesOut += bytesOut;
           bucket.statusCodes[statusCode] = (bucket.statusCodes[statusCode] || 0) + 1;
