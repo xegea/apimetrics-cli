@@ -731,11 +731,31 @@ async function ensureVegeta(): Promise<void> {
     const arch = process.arch;
 
     let vegetaUrl: string;
+    let isWindows = false;
+    
     if (platform === 'darwin') {
       if (arch === 'arm64') {
         vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_arm64.tar.gz';
       } else {
         vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_darwin_amd64.tar.gz';
+      }
+    } else if (platform === 'win32') {
+      isWindows = true;
+      if (arch === 'x64') {
+        // Windows releases use zip format, not tar.gz
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.12.0/vegeta_12.12.0_windows_amd64.zip';
+      } else if (arch === 'arm64') {
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.12.0/vegeta_12.12.0_windows_arm64.zip';
+      } else {
+        throw new Error(`Unsupported Windows architecture: ${arch}`);
+      }
+    } else if (platform === 'linux') {
+      if (arch === 'x64') {
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_linux_amd64.tar.gz';
+      } else if (arch === 'arm64') {
+        vegetaUrl = 'https://github.com/tsenart/vegeta/releases/download/v12.13.0/vegeta_12.13.0_linux_arm64.tar.gz';
+      } else {
+        throw new Error(`Unsupported Linux architecture: ${arch}`);
       }
     } else {
       throw new Error(`Unsupported platform: ${platform} ${arch}`);
@@ -743,72 +763,97 @@ async function ensureVegeta(): Promise<void> {
 
     try {
       const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}-${process.pid}`;
-      const tempDir = `/tmp/vegeta-install-${uniqueId}`;
-      await execa('rm', ['-rf', tempDir]);
-      await execa('mkdir', ['-p', tempDir]);
+      const tempDir = isWindows 
+        ? path.join(os.tmpdir(), `vegeta-install-${uniqueId}`)
+        : `/tmp/vegeta-install-${uniqueId}`;
+      
+      // Create temp directory
+      if (isWindows) {
+        await fs.mkdir(tempDir, { recursive: true });
+      } else {
+        await execa('rm', ['-rf', tempDir]);
+        await execa('mkdir', ['-p', tempDir]);
+      }
 
-      const tarballPath = `${tempDir}/vegeta.tar.gz`;
+      const archivePath = isWindows 
+        ? path.join(tempDir, 'vegeta.zip')
+        : path.join(tempDir, 'vegeta.tar.gz');
+      
       console.log(chalk.gray(`  Downloading from: ${vegetaUrl}`));
       
-      await execa('curl', ['-L', '-f', '-o', tarballPath, vegetaUrl], {
+      // Download using curl (available in Git Bash on Windows)
+      await execa('curl', ['-L', '-f', '-o', archivePath, vegetaUrl], {
         timeout: 60000
       });
 
-      const stats = await fs.stat(tarballPath);
+      const stats = await fs.stat(archivePath);
       if (stats.size === 0) {
         throw new Error('Downloaded file is empty');
       }
 
       console.log(chalk.gray(`  Extracting to: ${tempDir}`));
-      await execa('tar', ['-xzf', tarballPath, '-C', tempDir]);
-
-      const { stdout: lsOutput } = await execa('ls', ['-la', tempDir]);
-      console.log(chalk.gray(`  Contents of ${tempDir}:`));
-      lsOutput.split('\n').forEach(line => console.log(chalk.gray(`    ${line}`)));
-
-      let vegetaBinary: string | undefined;
-      try {
-        const { stdout: findOutput } = await execa('find', [tempDir, '-name', 'vegeta', '-type', 'f', '-executable']);
-        const lines = findOutput.trim().split('\n').filter(l => l.length > 0);
-        vegetaBinary = lines[0];
-        console.log(chalk.gray(`  Found vegeta binary at: ${vegetaBinary}`));
-      } catch (findError) {
-        console.log(chalk.gray(`  Find command failed, trying alternative method`));
-        vegetaBinary = `${tempDir}/vegeta`;
-        try {
-          await execa('test', ['-f', vegetaBinary]);
-        } catch {
-          try {
-            const { stdout: lsFiles } = await execa('find', [tempDir, '-type', 'f']);
-            const files = lsFiles.trim().split('\n');
-            vegetaBinary = files.find(f => f.includes('vegeta'));
-          } catch {
-            vegetaBinary = undefined;
-          }
-        }
+      
+      if (isWindows) {
+        // Use PowerShell to extract ZIP on Windows
+        await execa('powershell', [
+          '-Command',
+          `Expand-Archive -Path "${archivePath}" -DestinationPath "${tempDir}" -Force`
+        ]);
+      } else {
+        await execa('tar', ['-xzf', archivePath, '-C', tempDir]);
       }
 
-      if (!vegetaBinary) {
-        throw new Error('Could not find vegeta binary in downloaded archive.');
+      // Find vegeta binary
+      const vegetaBinaryName = isWindows ? 'vegeta.exe' : 'vegeta';
+      const vegetaBinary = path.join(tempDir, vegetaBinaryName);
+      
+      // Check if binary exists
+      try {
+        await fs.access(vegetaBinary);
+        console.log(chalk.gray(`  Found vegeta binary at: ${vegetaBinary}`));
+      } catch {
+        throw new Error(`Could not find ${vegetaBinaryName} in downloaded archive.`);
       }
 
       console.log(chalk.gray(`  Installing binary: ${vegetaBinary}`));
 
-      try {
-        await execa('sudo', ['mv', vegetaBinary, '/usr/local/bin/vegeta']);
-        await execa('sudo', ['chmod', '+x', '/usr/local/bin/vegeta']);
-        console.log(chalk.green('✅ Vegeta installed to /usr/local/bin'));
-      } catch (sudoError) {
-        const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
-        await execa('mkdir', ['-p', userBinDir]);
-        await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
-        await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
-        process.env.PATH = `${userBinDir}:${process.env.PATH}`;
-        console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
-        console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH'));
+      if (isWindows) {
+        // On Windows, install to user's local bin directory
+        const localBinDir = path.join(os.homedir(), '.local', 'bin');
+        await fs.mkdir(localBinDir, { recursive: true });
+        
+        const targetPath = path.join(localBinDir, 'vegeta.exe');
+        await fs.copyFile(vegetaBinary, targetPath);
+        
+        // Update PATH for current process
+        process.env.PATH = `${localBinDir};${process.env.PATH}`;
+        
+        console.log(chalk.green(`✅ Vegeta installed to ${localBinDir}`));
+        console.log(chalk.yellow(`⚠️  Add to your PATH: ${localBinDir}`));
+      } else {
+        // Unix installation
+        try {
+          await execa('sudo', ['mv', vegetaBinary, '/usr/local/bin/vegeta']);
+          await execa('sudo', ['chmod', '+x', '/usr/local/bin/vegeta']);
+          console.log(chalk.green('✅ Vegeta installed to /usr/local/bin'));
+        } catch (sudoError) {
+          const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
+          await execa('mkdir', ['-p', userBinDir]);
+          await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
+          await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
+          process.env.PATH = `${userBinDir}:${process.env.PATH}`;
+          console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
+          console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH'));
+        }
       }
 
-      await execa('rm', ['-rf', tempDir]);
+      // Clean up
+      if (isWindows) {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      } else {
+        await execa('rm', ['-rf', tempDir]);
+      }
+      
       console.log(chalk.green('✅ Vegeta installed successfully'));
     } catch (downloadError) {
       console.error(chalk.red('❌ Failed to download Vegeta:'), downloadError instanceof Error ? downloadError.message : String(downloadError));
@@ -819,20 +864,25 @@ async function ensureVegeta(): Promise<void> {
 
 export async function executePlanCommand(planFile: string, options: RunOptions): Promise<void> {
   try {
+    // Expand ~ to home directory for cross-platform compatibility
     let resolvedPlanFile = planFile;
-    if (planFile.includes('*')) {
-      const dirname = path.dirname(path.resolve(planFile));
-      const pattern = path.basename(planFile);
+    if (planFile.startsWith('~')) {
+      resolvedPlanFile = path.join(os.homedir(), planFile.slice(1));
+    }
+    
+    if (resolvedPlanFile.includes('*')) {
+      const dirname = path.dirname(path.resolve(resolvedPlanFile));
+      const pattern = path.basename(resolvedPlanFile);
       const files = await fs.readdir(dirname);
       const regex = new RegExp(`^${pattern.replace(/\*/g, '.*')}$`);
       const matches = files.filter(f => regex.test(f));
       
       if (matches.length === 0) {
-        throw new Error(`No execution plan files found matching pattern: ${planFile}`);
+        throw new Error(`No execution plan files found matching pattern: ${resolvedPlanFile}`);
       }
       
       if (matches.length > 1) {
-        throw new Error(`Multiple execution plan files found matching pattern: ${planFile}`);
+        throw new Error(`Multiple execution plan files found matching pattern: ${resolvedPlanFile}`);
       }
       
       resolvedPlanFile = path.join(dirname, matches[0]);
