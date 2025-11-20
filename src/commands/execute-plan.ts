@@ -154,12 +154,12 @@ async function uploadMetricsBucket(
       totalRequests,
       successCount: bucketState.successCount,
       failureCount: bucketState.failureCount,
-      avgLatency: Math.round(avgLatency),
-      minLatency: Math.round(minLatency),
-      maxLatency: Math.round(maxLatency),
-      p50Latency: Math.round(calculatePercentile(sortedLatencies, 0.5)),
-      p95Latency: Math.round(calculatePercentile(sortedLatencies, 0.95)),
-      p99Latency: Math.round(calculatePercentile(sortedLatencies, 0.99)),
+      avgLatency: Math.round(avgLatency / 1000000), // Convert nanoseconds to milliseconds
+      minLatency: Math.round(minLatency / 1000000), // Convert nanoseconds to milliseconds
+      maxLatency: Math.round(maxLatency / 1000000), // Convert nanoseconds to milliseconds
+      p50Latency: Math.round(calculatePercentile(sortedLatencies, 0.5) / 1000000), // Convert nanoseconds to milliseconds
+      p95Latency: Math.round(calculatePercentile(sortedLatencies, 0.95) / 1000000), // Convert nanoseconds to milliseconds
+      p99Latency: Math.round(calculatePercentile(sortedLatencies, 0.99) / 1000000), // Convert nanoseconds to milliseconds
       successRate: bucketState.successCount / totalRequests,
       bytesIn: bucketState.bytesIn,
       bytesOut: bucketState.bytesOut,
@@ -170,7 +170,7 @@ async function uploadMetricsBucket(
     console.log(chalk.cyan(`\n   📦 Uploading metrics bucket #${bucketNumber}...`));
     console.log(chalk.gray(`      Time Range: ${bucketState.startTime.toISOString()} → ${bucketState.endTime.toISOString()}`));
     console.log(chalk.gray(`      Requests: ${totalRequests} (${bucketState.successCount} success, ${bucketState.failureCount} failed)`));
-    console.log(chalk.gray(`      Avg Latency: ${(bucketData.avgLatency / 1000000).toFixed(2)}ms`));
+    console.log(chalk.gray(`      Avg Latency: ${bucketData.avgLatency.toFixed(2)}ms`));
 
     const response = await axios.post(
       `${apiUrl}/loadtestsexecutions/${executionId}/buckets`,
@@ -325,6 +325,7 @@ async function runCombinedTests(
     const allMetrics: RequestMetric[] = [];
     const buckets: Map<number, BucketState> = new Map();
     const uploadedBuckets = new Set<number>(); // Track which buckets have been uploaded
+    const bucketsNeedingUpdate = new Set<number>(); // Track buckets that got modified after upload
     const bucketDuration = 5000; // 5 seconds
     let firstMetricTime: number | null = null;
     let totalRequests = 0;
@@ -334,6 +335,7 @@ async function runCombinedTests(
     let totalBytesIn = 0;
     let totalBytesOut = 0;
     const allLatencies: number[] = [];
+    let maxBucketKeySeen = -1; // Track the highest bucket key we've seen
 
     try {
       // Stream vegeta output: cat file | vegeta attack | vegeta encode -to json
@@ -400,7 +402,14 @@ async function runCombinedTests(
 
           // Assign to bucket based on 5-second windows from first metric
           const metricTime = timestamp.getTime();
-          const bucketKey = Math.floor((metricTime - firstMetricTime) / bucketDuration);
+          let bucketKey = Math.floor((metricTime - firstMetricTime) / bucketDuration);
+          
+          // Handle metrics that arrive before the first metric time (clock skew, out of order)
+          // Put them in bucket 0
+          if (bucketKey < 0) {
+            console.log(chalk.yellow(`   ⚠️  Metric arrived before first metric time, assigning to bucket 0`));
+            bucketKey = 0;
+          }
 
           // Create bucket if it doesn't exist
           if (!buckets.has(bucketKey)) {
@@ -425,6 +434,12 @@ async function runCombinedTests(
 
           // Add metric to current bucket
           const bucket = buckets.get(bucketKey)!;
+          
+          // If this bucket was already uploaded, mark it for update
+          if (uploadedBuckets.has(bucketKey)) {
+            bucketsNeedingUpdate.add(bucketKey);
+          }
+          
           bucket.metrics.push(metric);
           bucket.totalRequests++;
           bucket.latencies.push(latency);
@@ -442,14 +457,19 @@ async function runCombinedTests(
             bucket.errorSet.add(error);
           }
 
-          // Check if we've moved to a new bucket - if so, upload the previous one IMMEDIATELY
-          const prevBucketKey = bucketKey - 1;
-          if (prevBucketKey >= 0 && !uploadedBuckets.has(prevBucketKey) && buckets.has(prevBucketKey)) {
-            const prevBucket = buckets.get(prevBucketKey)!;
-            if (prevBucket.metrics.length > 0) {
-              // Upload the completed bucket IMMEDIATELY (happens during streaming)
-              await uploadMetricsBucket(executionId, prevBucketKey, prevBucket, token, apiUrl);
-              uploadedBuckets.add(prevBucketKey);
+          // When we see a metric from a new bucket, upload all previous buckets (real-time)
+          if (bucketKey > maxBucketKeySeen) {
+            maxBucketKeySeen = bucketKey;
+            
+            // Upload ALL completed buckets up to (but not including) the current bucket
+            for (let bk = 0; bk < bucketKey; bk++) {
+              if (!uploadedBuckets.has(bk) && buckets.has(bk)) {
+                const bucketToUpload = buckets.get(bk)!;
+                if (bucketToUpload.metrics.length > 0) {
+                  await uploadMetricsBucket(executionId, bk, bucketToUpload, token, apiUrl);
+                  uploadedBuckets.add(bk);
+                }
+              }
             }
           }
 
@@ -462,18 +482,40 @@ async function runCombinedTests(
         }
       }
 
-      // After stream ends, upload any remaining buckets that weren't uploaded yet
-      console.log(chalk.cyan(`\n📦 Uploading final metrics buckets...`));
+      // After stream ends, upload remaining buckets and update any that changed
+      console.log(chalk.cyan(`\n📦 Finalizing metrics buckets...`));
+      console.log(chalk.gray(`   Total buckets created: ${buckets.size}`));
+      console.log(chalk.gray(`   Already uploaded: ${uploadedBuckets.size}`));
+      console.log(chalk.gray(`   Need updates: ${bucketsNeedingUpdate.size}`));
+      
       const sortedBuckets = Array.from(buckets.entries())
         .sort(([keyA], [keyB]) => keyA - keyB);
 
-      // Only upload buckets with valid keys (>= 0) that weren't already uploaded
+      let bucketsUploaded = 0;
+      let bucketsUpdated = 0;
+      let totalMetricsInBuckets = 0;
+      
+      // Upload remaining buckets and update modified ones
       for (const [bucketKey, bucketState] of sortedBuckets) {
-        if (bucketKey >= 0 && !uploadedBuckets.has(bucketKey) && bucketState.metrics.length > 0) {
-          await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
-          uploadedBuckets.add(bucketKey);
+        if (bucketKey >= 0 && bucketState.metrics.length > 0) {
+          totalMetricsInBuckets += bucketState.metrics.length;
+          
+          if (!uploadedBuckets.has(bucketKey)) {
+            // New bucket - upload it
+            console.log(chalk.gray(`   → Uploading bucket #${bucketKey} with ${bucketState.metrics.length} metrics`));
+            await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
+            bucketsUploaded++;
+          } else if (bucketsNeedingUpdate.has(bucketKey)) {
+            // Bucket needs update - re-upload with corrected data
+            console.log(chalk.yellow(`   ⟳ Updating bucket #${bucketKey} with final ${bucketState.metrics.length} metrics`));
+            await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
+            bucketsUpdated++;
+          }
         }
       }
+      
+      console.log(chalk.green(`   ✅ Uploaded ${bucketsUploaded} new buckets, updated ${bucketsUpdated} buckets`));
+      console.log(chalk.green(`   ✅ Total metrics in all buckets: ${totalMetricsInBuckets}`));
 
       // Calculate final aggregated summary
       const sortedLatencies = allLatencies.sort((a, b) => a - b);
@@ -499,7 +541,8 @@ async function runCombinedTests(
       };
 
       console.log(chalk.cyan(`\n📊 Final Test Summary:`));
-      console.log(chalk.gray(`   Total Requests: ${totalRequests}`));
+      console.log(chalk.gray(`   Total Requests (all metrics): ${totalRequests}`));
+      console.log(chalk.gray(`   Total Requests (in buckets): ${Array.from(uploadedBuckets).reduce((sum, bk) => sum + (buckets.get(bk)?.metrics.length || 0), 0)}`));
       console.log(chalk.gray(`   Success Rate: ${(successRate * 100).toFixed(2)}%`));
       console.log(chalk.gray(`   Avg Latency: ${(results.avgLatency / 1000000).toFixed(2)}ms`));
       console.log(chalk.gray(`   P95 Latency: ${(results.p95Latency / 1000000).toFixed(2)}ms`));
