@@ -131,6 +131,7 @@ interface ExecutionPlan {
 
 async function uploadMetricsBucket(
   executionId: string,
+  testResultId: string,
   bucketNumber: number,
   bucketState: BucketState,
   token: string,
@@ -148,6 +149,7 @@ async function uploadMetricsBucket(
     const maxLatency = Math.max(...sortedLatencies);
 
     const bucketData = {
+      testResultId,
       bucketNumber,
       startTime: bucketState.startTime.toISOString(),
       endTime: bucketState.endTime.toISOString(),
@@ -196,34 +198,21 @@ async function uploadMetricsBucket(
   }
 }
 
-async function createTestResult(
+async function createInitialTestResult(
   executionId: string,
   testId: string,
-  results: any,
   token: string,
-  apiUrl: string,
-  requestMetrics?: RequestMetricSummary[]
-): Promise<boolean> {
+  apiUrl: string
+): Promise<string | null> {
   try {
-    console.log(chalk.cyan('\n📤 Uploading final TestResult...'));
+    console.log(chalk.cyan(`\n📝 Creating initial TestResult...`));
     
     const payload = {
-      ...results,
-      requestMetrics: requestMetrics || []
+      testId,
+      timestamp: new Date().toISOString(),
+      totalRequests: 0,
+      successRate: 0,
     };
-
-    if (requestMetrics && requestMetrics.length > 0) {
-      console.log(chalk.gray(`  Including ${requestMetrics.length} per-request metrics`));
-    }
-    
-    console.log(chalk.gray(`\n  📊 TestResult Summary:`));
-    console.log(chalk.gray(`     - Execution ID: ${executionId}`));
-    console.log(chalk.gray(`     - Total Requests: ${results.totalRequests}`));
-    console.log(chalk.gray(`     - Success Rate: ${(results.successRate * 100).toFixed(2)}%`));
-    console.log(chalk.gray(`     - Avg Latency: ${(results.avgLatency / 1000000).toFixed(2)}ms`));
-    console.log(chalk.gray(`     - P95 Latency: ${(results.p95Latency / 1000000).toFixed(2)}ms`));
-
-    console.log(chalk.gray(`\n  🔗 Posting TestResult to: ${apiUrl}/loadtestsexecutions/${executionId}/loadtests`));
 
     const response = await axios.post(
       `${apiUrl}/loadtestsexecutions/${executionId}/loadtests`,
@@ -237,12 +226,72 @@ async function createTestResult(
       }
     );
 
-    console.log(chalk.green(`\n  ✅ TestResult uploaded successfully`));
+    const testResultId = response.data.id;
+    console.log(chalk.green(`✅ TestResult created with ID: ${testResultId}`));
+    return testResultId;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      console.error(chalk.red(`❌ Failed to create TestResult:`), error.message);
+      if (error.response) {
+        console.error(chalk.red(`Response:`, JSON.stringify(error.response.data, null, 2)));
+      }
+    } else {
+      console.error(chalk.red(`❌ Unexpected error:`, error instanceof Error ? error.message : String(error)));
+    }
+    return null;
+  }
+}
+
+async function createTestResult(
+  executionId: string,
+  testResultId: string,
+  testId: string,
+  results: any,
+  token: string,
+  apiUrl: string,
+  requestMetrics?: RequestMetricSummary[]
+): Promise<boolean> {
+  try {
+    console.log(chalk.cyan('\n📤 Uploading final TestResult metrics...'));
+    
+    const payload = {
+      ...results,
+      testId,
+      requestMetrics: requestMetrics || []
+    };
+
+    if (requestMetrics && requestMetrics.length > 0) {
+      console.log(chalk.gray(`  Including ${requestMetrics.length} per-request metrics`));
+    }
+    
+    console.log(chalk.gray(`\n  📊 TestResult Summary:`));
+    console.log(chalk.gray(`     - Execution ID: ${executionId}`));
+    console.log(chalk.gray(`     - TestResult ID: ${testResultId}`));
+    console.log(chalk.gray(`     - Total Requests: ${results.totalRequests}`));
+    console.log(chalk.gray(`     - Success Rate: ${(results.successRate * 100).toFixed(2)}%`));
+    console.log(chalk.gray(`     - Avg Latency: ${(results.avgLatency / 1000000).toFixed(2)}ms`));
+    console.log(chalk.gray(`     - P95 Latency: ${(results.p95Latency / 1000000).toFixed(2)}ms`));
+
+    console.log(chalk.gray(`\n  🔗 Updating TestResult at: ${apiUrl}/loadtestsexecutions/${executionId}/loadtests/${testResultId}`));
+
+    const response = await axios.patch(
+      `${apiUrl}/loadtestsexecutions/${executionId}/loadtests/${testResultId}`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log(chalk.green(`\n  ✅ TestResult updated successfully`));
     console.log(chalk.gray(`     Response Status: ${response.status} ${response.statusText}`));
     return true;
   } catch (error) {
     if (axios.isAxiosError(error)) {
-      console.error(chalk.red(`\n  ⚠️  TestResult upload error:`), error.message);
+      console.error(chalk.red(`\n  ⚠️  TestResult update error:`), error.message);
       if (error.response) {
         console.error(chalk.red(`     Response Status: ${error.response.status} ${error.response.statusText}`));
         console.error(chalk.red(`     Response Data:`, JSON.stringify(error.response.data, null, 2)));
@@ -259,9 +308,11 @@ async function runCombinedTests(
   token: string,
   apiUrl: string,
   planName: string,
-  executionId: string
+  executionId: string,
+  testResultId: string
 ): Promise<boolean> {
   console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test with REAL-TIME streaming metrics`));
+  console.log(chalk.gray(`   TestResult ID: ${testResultId}`));
 
   let attackInput = '';
   let totalRequestCount = 0;
@@ -466,7 +517,7 @@ async function runCombinedTests(
               if (!uploadedBuckets.has(bk) && buckets.has(bk)) {
                 const bucketToUpload = buckets.get(bk)!;
                 if (bucketToUpload.metrics.length > 0) {
-                  await uploadMetricsBucket(executionId, bk, bucketToUpload, token, apiUrl);
+                  await uploadMetricsBucket(executionId, testResultId, bk, bucketToUpload, token, apiUrl);
                   uploadedBuckets.add(bk);
                 }
               }
@@ -503,12 +554,12 @@ async function runCombinedTests(
           if (!uploadedBuckets.has(bucketKey)) {
             // New bucket - upload it
             console.log(chalk.gray(`   → Uploading bucket #${bucketKey} with ${bucketState.metrics.length} metrics`));
-            await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
+            await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
             bucketsUploaded++;
           } else if (bucketsNeedingUpdate.has(bucketKey)) {
             // Bucket needs update - re-upload with corrected data
             console.log(chalk.yellow(`   ⟳ Updating bucket #${bucketKey} with final ${bucketState.metrics.length} metrics`));
-            await uploadMetricsBucket(executionId, bucketKey, bucketState, token, apiUrl);
+            await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
             bucketsUpdated++;
           }
         }
@@ -596,7 +647,7 @@ async function runCombinedTests(
 
       // Upload the final TestResult
       console.log(chalk.cyan(`\n📊 Uploading final TestResult with aggregated metrics...`));
-      const resultCreated = await createTestResult(executionId, results.testId, results, token, apiUrl, requestMetricSummaries);
+      const resultCreated = await createTestResult(executionId, testResultId, results.testId, results, token, apiUrl, requestMetricSummaries);
       return resultCreated;
     } catch (vegeteaError) {
       console.error(chalk.red(`\n❌ Vegeta streaming failed:`));
@@ -646,7 +697,7 @@ async function createLoadTestExecution(
   name: string,
   token: string,
   apiUrl: string
-): Promise<LoadTestExecution | null> {
+): Promise<any> {
   try {
     const response = await axios.post(
       `${apiUrl}/loadtestsexecutions`,
@@ -825,14 +876,36 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
 
     await ensureVegeta();
 
-    const executionId = plan.metadata.executionId;
-    if (!executionId) {
-      throw new Error("No execution ID in plan. Download fresh plan from Test Executions.");
+    let executionId: string;
+    if (plan.metadata.executionId) {
+      executionId = plan.metadata.executionId;
+    } else {
+      console.log(chalk.cyan(`\n🔧 No execution ID found in plan, creating new LoadTestExecution...`));
+      
+      // Create a new LoadTestExecution
+      // Use plan name as executionPlanId, or generate a unique one
+      const executionPlanId = plan.metadata.planName || `plan-${Date.now()}`;
+      const executionName = `${plan.metadata.name} - ${new Date().toISOString()}`;
+      
+      const newExecution = await createLoadTestExecution(executionPlanId, executionName, token, apiUrl);
+      if (!newExecution) {
+        throw new Error("Failed to create new LoadTestExecution");
+      }
+      
+      executionId = newExecution.id;
+      console.log(chalk.green(`✅ Created new LoadTestExecution: ${executionId}`));
     }
 
     console.log(chalk.cyan(`\n🚀 Starting load tests for execution: ${executionId}\n`));
 
-    const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, executionId);
+    // Create TestResult first to get testResultId for bucket uploads
+    const testId = `test-${Date.now()}`;
+    const testResultId = await createInitialTestResult(executionId, testId, token, apiUrl);
+    if (!testResultId) {
+      throw new Error("Failed to create TestResult");
+    }
+
+    const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, executionId, testResultId);
 
     if (uploadSuccess) {
       console.log(chalk.green(`\n🎉 Load test completed!`));
