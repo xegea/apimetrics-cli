@@ -423,8 +423,8 @@ async function runCombinedTests(
       console.log(chalk.gray(`   Processing results...`));
       const vegeta = execa('vegeta', [
         'encode',
-        '-to=json',
-        `-input=${resultsFile}`
+        '--to=json',
+        resultsFile
       ], {
         timeout: 600000,
         stdout: 'pipe',
