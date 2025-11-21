@@ -884,6 +884,9 @@ async function ensureVegeta(): Promise<void> {
 
 export async function executePlanCommand(planFile: string, options: RunOptions): Promise<void> {
   try {
+    console.log(chalk.cyan('\n🚀 ApiMetrics CLI starting...\n'));
+    console.log(chalk.gray('⏳ Initializing execution environment, please wait...'));
+    
     // Expand ~ to home directory for cross-platform compatibility
     let resolvedPlanFile = planFile;
     if (planFile.startsWith('~')) {
