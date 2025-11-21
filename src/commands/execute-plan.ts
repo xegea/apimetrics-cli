@@ -8,6 +8,7 @@ import os from "os";
 import { writeFileSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
 import readline from "readline";
+import { pipeline } from "stream/promises";
 
 interface RequestMetric {
   timestamp: string;
@@ -401,15 +402,42 @@ async function runCombinedTests(
 
     try {
       // Stream vegeta output: use shell to pipe for real-time results
-      // This works on all platforms that have a POSIX shell
       const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
       
       console.log(chalk.gray(`\n   Starting real-time vegeta stream...`));
       
-      const vegeta = execa('sh', ['-c', cmd], {
-        timeout: 600000,
-        stdout: 'pipe',
-      });
+      // Detect the actual shell environment using SHELL or PSModulePath
+      const isPowerShell = !!process.env.PSModulePath;
+      const isGitBash = process.env.SHELL?.includes('bash') || process.env.MSYSTEM?.includes('MINGW');
+      
+      let vegeta;
+      if (isPowerShell && !isGitBash) {
+        // Running in PowerShell or CMD - manually pipe using Node.js streams
+        console.log(chalk.gray('   Detected PowerShell/CMD environment - using stream piping'));
+        
+        const attack = execa('vegeta', ['attack', `-rate=${rps}`, `-duration=${duration}`, '-timeout=30s', `-targets=${tempFile}`], {
+          timeout: 600000,
+        });
+        
+        const encode = execa('vegeta', ['encode', '--to=json'], {
+          timeout: 600000,
+          stdout: 'pipe',
+        });
+        
+        // Manually pipe attack stdout to encode stdin
+        if (attack.stdout && encode.stdin) {
+          attack.stdout.pipe(encode.stdin);
+        }
+        
+        vegeta = encode;
+      } else {
+        // Running in Git Bash, Mac, or Linux - use sh with pipe
+        console.log(chalk.gray('   Detected Unix-like shell environment'));
+        vegeta = execa('sh', ['-c', cmd], {
+          timeout: 600000,
+          stdout: 'pipe',
+        });
+      }
 
       // Create readline interface to process JSON lines as they arrive
       const rl = readline.createInterface({
