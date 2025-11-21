@@ -398,13 +398,34 @@ async function runCombinedTests(
     let totalBytesOut = 0;
     const allLatencies: number[] = [];
     let maxBucketKeySeen = -1; // Track the highest bucket key we've seen
+    let resultsFile: string | null = null; // For cleanup
 
     try {
-      // Stream vegeta output: cat file | vegeta attack | vegeta encode -to json
-      const cmd = `cat "${tempFile}" | vegeta attack -rate=${rps} -duration=${duration} -timeout=30s | vegeta encode -to json`;
+      const isWindows = process.platform === 'win32';
       
-      // Use stdout: 'pipe' to stream output in real-time
-      const vegeta = execa('sh', ['-c', cmd], {
+      // Generate results file path
+      resultsFile = path.join(os.tmpdir(), `vegeta-results-${Date.now()}.bin`);
+      
+      // Step 1: Run vegeta attack and save to file (works on all platforms)
+      console.log(chalk.gray(`\n   Running vegeta attack...`));
+      await execa('vegeta', [
+        'attack',
+        `-rate=${rps}`,
+        `-duration=${duration}`,
+        '-timeout=30s',
+        `-targets=${tempFile}`,
+        `-output=${resultsFile}`
+      ], {
+        timeout: 600000,
+      });
+      
+      // Step 2: Encode results to JSON and stream
+      console.log(chalk.gray(`   Processing results...`));
+      const vegeta = execa('vegeta', [
+        'encode',
+        '-to=json',
+        `-input=${resultsFile}`
+      ], {
         timeout: 600000,
         stdout: 'pipe',
       });
@@ -668,14 +689,35 @@ async function runCombinedTests(
       // Upload the final TestResult
       console.log(chalk.cyan(`\n📊 Uploading final TestResult with aggregated metrics...`));
       const resultCreated = await createTestResult(executionId, testResultId, results.testId, results, token, apiUrl, requestMetricSummaries);
+      
+      // Clean up results file
+      if (resultsFile) {
+        try {
+          unlinkSync(resultsFile);
+        } catch (e) {
+          // Ignore
+        }
+      }
+      
       return resultCreated;
     } catch (vegeteaError) {
       console.error(chalk.red(`\n❌ Vegeta streaming failed:`));
       console.error(chalk.red(`  Command: vegeta attack | vegeta encode -to json`));
       console.error(chalk.red(`  Error: ${vegeteaError instanceof Error ? vegeteaError.message : String(vegeteaError)}`));
+      
+      // Clean up results file on error
+      if (resultsFile) {
+        try {
+          unlinkSync(resultsFile);
+        } catch (e) {
+          // Ignore
+        }
+      }
+      
       throw vegeteaError;
     }
   } finally {
+    // Clean up temp file
     try {
       unlinkSync(tempFile);
     } catch (e) {
