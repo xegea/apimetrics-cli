@@ -326,6 +326,7 @@ async function runCombinedTests(
   console.log(chalk.blue(`\n🔗 Combining ${tests.length} test(s) into single load test with REAL-TIME streaming metrics`));
   console.log(chalk.gray(`   TestResult ID: ${testResultId}`));
 
+  let binaryOutputFile = '';  // Declare at function level for cleanup in finally
   let attackInput = '';
   let totalRequestCount = 0;
 
@@ -401,52 +402,34 @@ async function runCombinedTests(
     let maxBucketKeySeen = -1; // Track the highest bucket key we've seen
 
     try {
-      // Stream vegeta output: use shell to pipe for real-time results
-      const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
+      console.log(chalk.gray(`\n   Starting vegeta load test...`));
       
-      console.log(chalk.gray(`\n   Starting real-time vegeta stream...`));
+      // Simple timeout wrapper for vegeta execution
+      const durationSeconds = parseInt(duration);
+      const totalTimeoutMs = (durationSeconds + 10) * 1000;  // Add 10 seconds buffer
       
-      // Detect the actual shell environment using SHELL or PSModulePath
-      const isPowerShell = !!process.env.PSModulePath;
-      const isGitBash = process.env.SHELL?.includes('bash') || process.env.MSYSTEM?.includes('MINGW');
+      console.log(chalk.gray(`   Running vegeta (timeout: ${totalTimeoutMs / 1000}s)`));
       
-      let vegeta;
-      if (isPowerShell && !isGitBash) {
-        // Running in PowerShell or CMD - manually pipe using Node.js streams
-        console.log(chalk.gray('   Detected PowerShell/CMD environment - using stream piping'));
-        
-        const attack = execa('vegeta', ['attack', `-rate=${rps}`, `-duration=${duration}`, '-timeout=30s', `-targets=${tempFile}`], {
-          timeout: 600000,
+      // Use execSync with timeout to run vegeta in-process
+      let jsonOutput: string;
+      try {
+        const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
+        jsonOutput = execSync(cmd, {
+          timeout: totalTimeoutMs,
+          encoding: 'utf8'
         });
-        
-        const encode = execa('vegeta', ['encode', '--to=json'], {
-          timeout: 600000,
-          stdout: 'pipe',
-        });
-        
-        // Manually pipe attack stdout to encode stdin
-        if (attack.stdout && encode.stdin) {
-          attack.stdout.pipe(encode.stdin);
+      } catch (syncError: any) {
+        if (syncError.signal === 'SIGTERM') {
+          throw new Error(`Vegeta timeout after ${totalTimeoutMs / 1000}s - targets may be unreachable`);
         }
-        
-        vegeta = encode;
-      } else {
-        // Running in Git Bash, Mac, or Linux - use sh with pipe
-        console.log(chalk.gray('   Detected Unix-like shell environment'));
-        vegeta = execa('sh', ['-c', cmd], {
-          timeout: 600000,
-          stdout: 'pipe',
-        });
+        throw syncError;
       }
 
-      // Create readline interface to process JSON lines as they arrive
-      const rl = readline.createInterface({
-        input: vegeta.stdout as any,
-        crlfDelay: Infinity,
-      });
-
-      // Process each JSON line in real-time
-      for await (const line of rl) {
+      // Parse the JSON output line by line
+      const lines = jsonOutput.split('\n').filter(l => l.trim());
+      console.log(chalk.gray(`\n   Processing ${lines.length} metrics from vegeta...`));
+      
+      for (const line of lines) {
         if (!line.trim()) continue;
 
         try {
@@ -708,11 +691,12 @@ async function runCombinedTests(
       throw vegeteaError;
     }
   } finally {
-    // Clean up temp file
+    // Clean up temp files
     try {
       unlinkSync(tempFile);
+      unlinkSync(binaryOutputFile);
     } catch (e) {
-      // Ignore
+      // Ignore - files might not exist
     }
   }
 }
@@ -884,20 +868,52 @@ async function ensureVegeta(): Promise<void> {
         console.log(chalk.green(`✅ Vegeta installed to ${localBinDir}`));
         console.log(chalk.yellow(`⚠️  Add to your PATH: ${localBinDir}`));
       } else {
-        // Unix installation
-        try {
-          await execa('sudo', ['mv', vegetaBinary, '/usr/local/bin/vegeta']);
-          await execa('sudo', ['chmod', '+x', '/usr/local/bin/vegeta']);
-          console.log(chalk.green('✅ Vegeta installed to /usr/local/bin'));
-        } catch (sudoError) {
-          const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
-          await execa('mkdir', ['-p', userBinDir]);
-          await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
-          await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
-          process.env.PATH = `${userBinDir}:${process.env.PATH}`;
-          console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
-          console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH'));
-        }
+        // Unix installation - use user bin directory to avoid sudo password prompt
+        const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
+        const lockFile = path.join(userBinDir, '.vegeta-install.lock');
+          
+          // Wait for any other process to finish installing
+          let waitAttempts = 0;
+          while (await fs.access(lockFile).then(() => true).catch(() => false)) {
+            if (waitAttempts > 30) {
+              throw new Error('Timeout waiting for vegeta installation lock');
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+            waitAttempts++;
+          }
+          
+          // Create lock file
+          try {
+            await fs.writeFile(lockFile, `${Date.now()}`);
+          } catch (e) {
+            // Lock file already exists from another process, wait a bit more
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
+          try {
+            await execa('mkdir', ['-p', userBinDir]);
+            
+            // Check if vegeta already installed (another process might have done it)
+            try {
+              await fs.access(path.join(userBinDir, 'vegeta'));
+              console.log(chalk.green(`✅ Vegeta already installed to ${userBinDir}`));
+            } catch {
+              // Not installed yet, do it now
+              await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
+              await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
+              console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
+            }
+          } finally {
+            // Remove lock file
+            try {
+              await fs.unlink(lockFile);
+            } catch (e) {
+              // Ignore
+            }
+          }
+          
+        process.env.PATH = `${userBinDir}:${process.env.PATH}`;
+        console.log(chalk.yellow('⚠️  You may need to add ~/.local/bin to your PATH'));
       }
 
       // Clean up
