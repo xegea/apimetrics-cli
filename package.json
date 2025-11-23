@@ -1,6 +1,6 @@
 {
   "name": "@xegea/apimetrics-cli",
-  "version": "0.2.33",
+  "version": "0.2.34",
   "description": "CLI to run API load tests locally with Vegeta and upload results to Apimetrics.ai",
   "license": "MIT",
   "type": "module",
