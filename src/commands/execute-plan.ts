@@ -423,48 +423,35 @@ async function runCombinedTests(
       console.log(chalk.gray(`   Vegeta config: RPS=${rps}, Duration=${duration}`));
       console.log(chalk.gray(`   Temp file: ${tempFile}`));
       
-      // Use execSync with timeout to run vegeta in-process
-      let jsonOutput: string;
+      // Use a streaming vegeta process so we can process metrics as they arrive
+      const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
+      console.log(chalk.gray(`   🔄 Executing vegeta command: ${cmd}`));
+      console.log(chalk.gray(`   Streaming output for real-time processing (timeout: ${totalTimeoutMs / 1000}s)`));
+
       const vegaStartTime = Date.now();
-      try {
-        const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
-        console.log(chalk.gray(`   🔄 Executing vegeta command: ${cmd}`));
-        jsonOutput = execSync(cmd, {
-          timeout: totalTimeoutMs,
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe']
+      const vegetaProc = execa('bash', ['-lc', cmd], {
+        buffer: false,
+        timeout: totalTimeoutMs,
+      });
+
+      // Pipe stderr to console for diagnostics
+      if (vegetaProc.stderr) {
+        vegetaProc.stderr.on('data', (chunk: Buffer | string) => {
+          const text = chunk instanceof Buffer ? chunk.toString('utf8') : String(chunk);
+          console.log(chalk.yellow(`   vegeta stderr: ${text.trim()}`));
         });
-        const vegaDuration = Date.now() - vegaStartTime;
-        console.log(chalk.gray(`   ✓ Vegeta completed in ${vegaDuration}ms`));
-      } catch (syncError: any) {
-        console.log(chalk.red(`   ❌ Vegeta execution error`));
-        console.log(chalk.red(`   Error type: ${syncError.code || syncError.signal || 'UNKNOWN'}`));
-        console.log(chalk.red(`   Error message: ${syncError.message}`));
-        if (syncError.signal === 'SIGTERM') {
-          throw new Error(`Vegeta timeout after ${totalTimeoutMs / 1000}s - targets may be unreachable`);
-        }
-        throw syncError;
       }
 
-      // Parse the JSON output line by line
-      console.log(chalk.gray(`\n   📊 Vegeta output received, parsing metrics...`));
-      console.log(chalk.gray(`   📌 Output length: ${jsonOutput.length} characters`));
-      
-      const lines = jsonOutput.split('\n').filter(l => l.trim());
-      console.log(chalk.gray(`   📊 Total lines to process: ${lines.length}`));
-      
-      if (lines.length === 0) {
-        console.log(chalk.yellow(`   ⚠️  WARNING: No metrics received from vegeta!`));
-        console.log(chalk.yellow(`   ⚠️  This usually means vegeta didn't generate requests.`));
-        console.log(chalk.gray(`   Raw vegeta output (first 500 chars): ${jsonOutput.substring(0, 500)}`));
-      }
-      
+      console.log(chalk.gray(`\n   📊 Vegeta streaming started`));
       console.log(chalk.gray(`\n   🔄 Starting metric processing loop...`));
       let metricProcessingStartTime = Date.now();
       let linesParsed = 0;
       let linesFailed = 0;
-      
-      for (const line of lines) {
+      let jsonLineCount = 0;
+
+      const rl = readline.createInterface({ input: vegetaProc.stdout! });
+      try {
+        for await (const line of rl) {
         if (!line.trim()) continue;
 
         try {
@@ -604,6 +591,27 @@ async function runCombinedTests(
             console.warn(chalk.yellow(`      Parse error: ${parseError instanceof Error ? parseError.message : String(parseError)}`));
           }
         }
+        }
+
+        // Keep an eye on the process in case it's done
+      } finally {
+        rl.close();
+      }
+
+      // Wait for vegeta to finish (or timeout)
+      try {
+        await vegetaProc;
+        const vegaDuration = Date.now() - vegaStartTime;
+        console.log(chalk.gray(`   ✓ Vegeta completed in ${vegaDuration}ms`));
+      } catch (procErr: any) {
+        // If the process timed out, let the rest of the logic handle it
+        console.log(chalk.red(`   ❌ Vegeta execution error`));
+        console.log(chalk.red(`   Error type: ${procErr.code || procErr.signal || 'UNKNOWN'}`));
+        console.log(chalk.red(`   Error message: ${procErr.message}`));
+        if (procErr.signal === 'SIGTERM' || procErr.timedOut) {
+          throw new Error(`Vegeta timeout after ${totalTimeoutMs / 1000}s - targets may be unreachable`);
+        }
+        throw procErr;
       }
       
       const metricProcessingDuration = Date.now() - metricProcessingStartTime;
