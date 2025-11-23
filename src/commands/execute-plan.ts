@@ -179,21 +179,34 @@ async function uploadMetricsBucket(
     console.log(chalk.gray(`      Time Range: ${bucketState.startTime.toISOString()} → ${bucketState.endTime.toISOString()}`));
     console.log(chalk.gray(`      Requests: ${totalRequests} (${bucketState.successCount} success, ${bucketState.failureCount} failed)`));
     console.log(chalk.gray(`      Avg Latency: ${bucketData.avgLatency.toFixed(2)}ms`));
+    console.log(chalk.gray(`      📌 ExecutionId: ${executionId}`));
+    console.log(chalk.gray(`      📌 TestResultId: ${testResultId}`));
+    console.log(chalk.gray(`      📌 API URL: ${apiUrl}/loadtestsexecutions/${executionId}/buckets`));
+    console.log(chalk.gray(`      📌 Payload size: ${JSON.stringify(bucketData).length} bytes`));
 
-    const response = await axios.post(
-      `${apiUrl}/loadtestsexecutions/${executionId}/buckets`,
-      bucketData,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000,
-      }
-    );
+    const uploadStartTime = Date.now();
+    try {
+      const response = await axios.post(
+        `${apiUrl}/loadtestsexecutions/${executionId}/buckets`,
+        bucketData,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 10000,
+        }
+      );
 
-    console.log(chalk.green(`      ✅ Bucket #${bucketNumber} uploaded (ID: ${response.data.id})`));
-    return true;
+      const uploadDuration = Date.now() - uploadStartTime;
+      console.log(chalk.green(`      ✅ Bucket #${bucketNumber} uploaded (ID: ${response.data.id}, took ${uploadDuration}ms)`));
+      console.log(chalk.gray(`      Response Status: ${response.status}`));
+      return true;
+    } catch (uploadError) {
+      const uploadDuration = Date.now() - uploadStartTime;
+      console.log(chalk.red(`      ❌ Upload failed after ${uploadDuration}ms`));
+      throw uploadError;
+    }
   } catch (error) {
     if (axios.isAxiosError(error)) {
       console.error(chalk.red(`      ❌ Bucket upload error:`), error.message);
@@ -403,22 +416,35 @@ async function runCombinedTests(
 
     try {
       console.log(chalk.gray(`\n   Starting vegeta load test...`));
+      console.log(chalk.gray(`   📌 ExecutionId: ${executionId}`));
+      console.log(chalk.gray(`   📌 TestResultId: ${testResultId}`));
+      console.log(chalk.gray(`   📌 Process ID: ${process.pid}`));
       
       // Simple timeout wrapper for vegeta execution
       const durationSeconds = parseInt(duration);
       const totalTimeoutMs = (durationSeconds + 10) * 1000;  // Add 10 seconds buffer
       
       console.log(chalk.gray(`   Running vegeta (timeout: ${totalTimeoutMs / 1000}s)`));
+      console.log(chalk.gray(`   Vegeta config: RPS=${rps}, Duration=${duration}`));
+      console.log(chalk.gray(`   Temp file: ${tempFile}`));
       
       // Use execSync with timeout to run vegeta in-process
       let jsonOutput: string;
+      const vegaStartTime = Date.now();
       try {
         const cmd = `vegeta attack -rate=${rps} -duration=${duration} -timeout=30s -targets="${tempFile}" | vegeta encode --to=json`;
+        console.log(chalk.gray(`   🔄 Executing vegeta command: ${cmd}`));
         jsonOutput = execSync(cmd, {
           timeout: totalTimeoutMs,
-          encoding: 'utf8'
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe']
         });
+        const vegaDuration = Date.now() - vegaStartTime;
+        console.log(chalk.gray(`   ✓ Vegeta completed in ${vegaDuration}ms`));
       } catch (syncError: any) {
+        console.log(chalk.red(`   ❌ Vegeta execution error`));
+        console.log(chalk.red(`   Error type: ${syncError.code || syncError.signal || 'UNKNOWN'}`));
+        console.log(chalk.red(`   Error message: ${syncError.message}`));
         if (syncError.signal === 'SIGTERM') {
           throw new Error(`Vegeta timeout after ${totalTimeoutMs / 1000}s - targets may be unreachable`);
         }
@@ -426,8 +452,22 @@ async function runCombinedTests(
       }
 
       // Parse the JSON output line by line
+      console.log(chalk.gray(`\n   📊 Vegeta output received, parsing metrics...`));
+      console.log(chalk.gray(`   📌 Output length: ${jsonOutput.length} characters`));
+      
       const lines = jsonOutput.split('\n').filter(l => l.trim());
-      console.log(chalk.gray(`\n   Processing ${lines.length} metrics from vegeta...`));
+      console.log(chalk.gray(`   📊 Total lines to process: ${lines.length}`));
+      
+      if (lines.length === 0) {
+        console.log(chalk.yellow(`   ⚠️  WARNING: No metrics received from vegeta!`));
+        console.log(chalk.yellow(`   ⚠️  This usually means vegeta didn't generate requests.`));
+        console.log(chalk.gray(`   Raw vegeta output (first 500 chars): ${jsonOutput.substring(0, 500)}`));
+      }
+      
+      console.log(chalk.gray(`\n   🔄 Starting metric processing loop...`));
+      let metricProcessingStartTime = Date.now();
+      let linesParsed = 0;
+      let linesFailed = 0;
       
       for (const line of lines) {
         if (!line.trim()) continue;
@@ -455,6 +495,7 @@ async function runCombinedTests(
 
           allMetrics.push(metric);
           totalRequests++;
+          linesParsed++;
           
           if (statusCode >= 200 && statusCode < 300) {
             successRequests++;
@@ -476,7 +517,7 @@ async function runCombinedTests(
           // Initialize first metric time
           if (firstMetricTime === null) {
             firstMetricTime = timestamp.getTime();
-            console.log(chalk.gray(`\n   Execution started at: ${timestamp.toISOString()}`));
+            console.log(chalk.gray(`\n   ⏱️  First metric received at: ${timestamp.toISOString()}`));
           }
 
           // Assign to bucket based on 5-second windows from first metric
@@ -486,7 +527,7 @@ async function runCombinedTests(
           // Handle metrics that arrive before the first metric time (clock skew, out of order)
           // Put them in bucket 0
           if (bucketKey < 0) {
-            console.log(chalk.yellow(`   ⚠️  Metric arrived before first metric time, assigning to bucket 0`));
+            console.log(chalk.yellow(`   ⚠️  Metric arrived before first metric time (clock skew), assigning to bucket 0. Metric time: ${metricTime}, First metric time: ${firstMetricTime}`));
             bucketKey = 0;
           }
 
@@ -562,9 +603,21 @@ async function runCombinedTests(
             console.log(chalk.gray(`   ✓ Processed ${totalRequests} metrics in real-time...`));
           }
         } catch (parseError) {
-          console.warn(chalk.yellow(`   ⚠️  Skipped unparseable line: ${line.substring(0, 50)}`));
+          linesFailed++;
+          console.warn(chalk.yellow(`   ⚠️  Skipped unparseable line (error #${linesFailed}): ${line.substring(0, 50)}`));
+          if (linesFailed <= 3) {
+            console.warn(chalk.yellow(`      Parse error: ${parseError instanceof Error ? parseError.message : String(parseError)}`));
+          }
         }
       }
+      
+      const metricProcessingDuration = Date.now() - metricProcessingStartTime;
+      console.log(chalk.gray(`\n   📊 Metric processing completed in ${metricProcessingDuration}ms`));
+      console.log(chalk.gray(`   📌 Total lines parsed: ${linesParsed}`));
+      console.log(chalk.gray(`   📌 Lines failed to parse: ${linesFailed}`));
+      console.log(chalk.gray(`   📌 Total requests collected: ${totalRequests}`));
+      console.log(chalk.gray(`   📌 Success requests: ${successRequests}`));
+      console.log(chalk.gray(`   📌 All latencies collected: ${allLatencies.length}`));
 
       // After stream ends, upload remaining buckets and update any that changed
       console.log(chalk.cyan(`\n📦 Finalizing metrics buckets...`));
@@ -579,21 +632,41 @@ async function runCombinedTests(
       let bucketsUpdated = 0;
       let totalMetricsInBuckets = 0;
       
+      console.log(chalk.gray(`\n   📌 Bucket details:`));
+      for (const [bk, bs] of sortedBuckets) {
+        console.log(chalk.gray(`      Bucket #${bk}: ${bs.metrics.length} metrics, time range: ${bs.startTime.toISOString()} → ${bs.endTime.toISOString()}`));
+      }
+      
       // Upload remaining buckets and update modified ones
+      console.log(chalk.gray(`\n   🚀 Starting bucket upload process...`));
       for (const [bucketKey, bucketState] of sortedBuckets) {
         if (bucketKey >= 0 && bucketState.metrics.length > 0) {
           totalMetricsInBuckets += bucketState.metrics.length;
           
           if (!uploadedBuckets.has(bucketKey)) {
             // New bucket - upload it
-            console.log(chalk.gray(`   → Uploading bucket #${bucketKey} with ${bucketState.metrics.length} metrics`));
-            await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
-            bucketsUploaded++;
+            console.log(chalk.gray(`   → [${bucketsUploaded + 1}] Uploading bucket #${bucketKey} with ${bucketState.metrics.length} metrics`));
+            const uploadStart = Date.now();
+            try {
+              await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
+              const uploadDuration = Date.now() - uploadStart;
+              console.log(chalk.gray(`      ✓ Uploaded in ${uploadDuration}ms`));
+              bucketsUploaded++;
+            } catch (uploadError) {
+              console.log(chalk.red(`      ✗ Failed to upload: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}`));
+            }
           } else if (bucketsNeedingUpdate.has(bucketKey)) {
             // Bucket needs update - re-upload with corrected data
             console.log(chalk.yellow(`   ⟳ Updating bucket #${bucketKey} with final ${bucketState.metrics.length} metrics`));
-            await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
-            bucketsUpdated++;
+            const updateStart = Date.now();
+            try {
+              await uploadMetricsBucket(executionId, testResultId, bucketKey, bucketState, token, apiUrl);
+              const updateDuration = Date.now() - updateStart;
+              console.log(chalk.gray(`      ✓ Updated in ${updateDuration}ms`));
+              bucketsUpdated++;
+            } catch (updateError) {
+              console.log(chalk.red(`      ✗ Failed to update: ${updateError instanceof Error ? updateError.message : String(updateError)}`));
+            }
           }
         }
       }
@@ -757,12 +830,18 @@ async function createLoadTestExecution(
 }
 
 async function ensureVegeta(): Promise<void> {
+  const checkStartTime = Date.now();
+  console.log(chalk.gray(`\n📌 Checking for vegeta (Process ID: ${process.pid})...`));
+  
   try {
     const { stdout } = await execa('vegeta', ['version'], { timeout: 5000 });
-    console.log(chalk.green(`✅ Vegeta is available: ${stdout.trim().split('\n')[0]}`));
+    const checkDuration = Date.now() - checkStartTime;
+    console.log(chalk.green(`✅ Vegeta is available: ${stdout.trim().split('\n')[0]} (check took ${checkDuration}ms)`));
     return;
   } catch (error) {
-    console.log(chalk.yellow('⚠️  Vegeta not found in PATH, attempting to install...'));
+    const checkDuration = Date.now() - checkStartTime;
+    console.log(chalk.yellow(`⚠️  Vegeta not found in PATH (check took ${checkDuration}ms), attempting to install...`));
+    console.log(chalk.gray(`   📌 Check error: ${error instanceof Error ? error.message : String(error)}`));
 
     const platform = process.platform;
     const arch = process.arch;
@@ -871,44 +950,66 @@ async function ensureVegeta(): Promise<void> {
         // Unix installation - use user bin directory to avoid sudo password prompt
         const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
         const lockFile = path.join(userBinDir, '.vegeta-install.lock');
+        
+        console.log(chalk.gray(`  📌 Unix installation: userBinDir=${userBinDir}`));
+        console.log(chalk.gray(`  📌 Lock file: ${lockFile}`));
+        console.log(chalk.gray(`  📌 Process ID: ${process.pid}`));
           
           // Wait for any other process to finish installing
           let waitAttempts = 0;
+          const lockWaitStart = Date.now();
           while (await fs.access(lockFile).then(() => true).catch(() => false)) {
+            if (waitAttempts % 5 === 0) {
+              console.log(chalk.gray(`  📌 Waiting for lock file... (attempt ${waitAttempts + 1}, ${Date.now() - lockWaitStart}ms)`));
+            }
             if (waitAttempts > 30) {
-              throw new Error('Timeout waiting for vegeta installation lock');
+              throw new Error(`Timeout waiting for vegeta installation lock after ${Date.now() - lockWaitStart}ms`);
             }
             await new Promise(resolve => setTimeout(resolve, 100));
             waitAttempts++;
           }
           
+          if (waitAttempts > 0) {
+            console.log(chalk.gray(`  📌 Lock file released after ${waitAttempts} attempts (${Date.now() - lockWaitStart}ms)`));
+          }
+          
           // Create lock file
+          const lockCreateStart = Date.now();
           try {
-            await fs.writeFile(lockFile, `${Date.now()}`);
+            await fs.writeFile(lockFile, `${Date.now()}-${process.pid}`);
+            console.log(chalk.gray(`  📌 Lock file created (${Date.now() - lockCreateStart}ms)`));
           } catch (e) {
             // Lock file already exists from another process, wait a bit more
+            console.log(chalk.gray(`  📌 Lock file creation failed, waiting for other process...`));
             await new Promise(resolve => setTimeout(resolve, 500));
           }
           
           try {
+            const mkdirStart = Date.now();
             await execa('mkdir', ['-p', userBinDir]);
+            console.log(chalk.gray(`  📌 userBinDir created/exists (${Date.now() - mkdirStart}ms)`));
             
             // Check if vegeta already installed (another process might have done it)
+            const checkStart = Date.now();
             try {
               await fs.access(path.join(userBinDir, 'vegeta'));
-              console.log(chalk.green(`✅ Vegeta already installed to ${userBinDir}`));
+              console.log(chalk.green(`✅ Vegeta already installed to ${userBinDir} (checked in ${Date.now() - checkStart}ms)`));
             } catch {
               // Not installed yet, do it now
+              const cpStart = Date.now();
               await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
               await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
-              console.log(chalk.green(`✅ Vegeta installed to ${userBinDir}`));
+              const cpDuration = Date.now() - cpStart;
+              console.log(chalk.green(`✅ Vegeta installed to ${userBinDir} (took ${cpDuration}ms)`));
             }
           } finally {
             // Remove lock file
             try {
               await fs.unlink(lockFile);
+              console.log(chalk.gray(`  📌 Lock file removed`));
             } catch (e) {
               // Ignore
+              console.log(chalk.gray(`  📌 Lock file removal failed (this is ok)`));
             }
           }
           
@@ -932,9 +1033,16 @@ async function ensureVegeta(): Promise<void> {
 }
 
 export async function executePlanCommand(planFile: string, options: RunOptions): Promise<void> {
+  const globalStartTime = Date.now();
+  const sessionId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  
   try {
     console.log(chalk.cyan('\n🚀 ApiMetrics CLI starting...\n'));
     console.log(chalk.gray('⏳ Initializing execution environment, please wait...'));
+    console.log(chalk.gray(`📌 Session ID: ${sessionId}`));
+    console.log(chalk.gray(`📌 Process ID: ${process.pid}`));
+    console.log(chalk.gray(`📌 Node Version: ${process.version}`));
+    console.log(chalk.gray(`📌 Platform: ${os.platform()}`));
     
     // Expand ~ to home directory for cross-platform compatibility
     let resolvedPlanFile = planFile;
@@ -1019,27 +1127,51 @@ export async function executePlanCommand(planFile: string, options: RunOptions):
     }
 
     console.log(chalk.cyan(`\n🚀 Starting load tests for execution: ${executionId}\n`));
+    console.log(chalk.gray(`📌 Execution ID: ${executionId}`));
+    console.log(chalk.gray(`📌 Session ID: ${sessionId}`));
 
     // Create TestResult first to get testResultId for bucket uploads
     const testId = `test-${Date.now()}`;
+    console.log(chalk.gray(`📌 Test ID: ${testId}`));
+    console.log(chalk.gray(`📌 About to create initial TestResult...`));
+    
+    const testResultCreateStart = Date.now();
     const testResultId = await createInitialTestResult(executionId, testId, token, apiUrl);
+    const testResultCreateDuration = Date.now() - testResultCreateStart;
+    console.log(chalk.gray(`📌 TestResult creation took ${testResultCreateDuration}ms`));
+    
     if (!testResultId) {
       throw new Error("Failed to create TestResult");
     }
+    console.log(chalk.gray(`📌 TestResult ID: ${testResultId}`));
 
+    console.log(chalk.gray(`\n📌 About to start combined load tests...`));
+    const loadTestStart = Date.now();
     const uploadSuccess = await runCombinedTests(plan.tests, token, apiUrl, plan.metadata.name, executionId, testResultId);
+    const loadTestDuration = Date.now() - loadTestStart;
+    console.log(chalk.gray(`📌 Combined load tests completed in ${loadTestDuration}ms`));
 
     if (uploadSuccess) {
+      const totalDuration = Date.now() - globalStartTime;
       console.log(chalk.green(`\n🎉 Load test completed!`));
       console.log(chalk.green(`📊 Results have been added to your execution`));
       console.log(chalk.green(`🌐 View results at: https://apimetrics.ai`));
+      console.log(chalk.gray(`\n📌 Total execution time: ${totalDuration}ms`));
+      console.log(chalk.gray(`📌 Session ID: ${sessionId}`));
     } else {
       console.log(chalk.yellow(`\n⚠️  Test result failed to upload.`));
       console.log(chalk.yellow(`🔗 Try running again or check your API connection.`));
+      console.log(chalk.gray(`📌 Session ID: ${sessionId}`));
     }
 
   } catch (error) {
+    const totalDuration = Date.now() - globalStartTime;
     console.error(chalk.red("❌ Error:"), error instanceof Error ? error.message : String(error));
+    console.error(chalk.gray(`📌 Session ID: ${sessionId}`));
+    console.error(chalk.gray(`📌 Total execution time before error: ${totalDuration}ms`));
+    if (error instanceof Error && error.stack) {
+      console.error(chalk.gray(`📌 Stack trace: ${error.stack}`));
+    }
     process.exit(1);
   }
 }
