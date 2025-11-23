@@ -149,11 +149,6 @@ async function uploadMetricsBucket(
     const minLatency = sortedLatencies.length > 0 ? Math.min(...sortedLatencies) : 0;
     const maxLatency = sortedLatencies.length > 0 ? Math.max(...sortedLatencies) : 0;
     
-    // Debug logging
-    console.log(chalk.gray(`      DEBUG: sortedLatencies.length = ${sortedLatencies.length}`));
-    console.log(chalk.gray(`      DEBUG: minLatency (ns) = ${minLatency}, maxLatency (ns) = ${maxLatency}`));
-    console.log(chalk.gray(`      DEBUG: minLatency (ms) = ${Math.round(minLatency / 1000000)}, maxLatency (ms) = ${Math.round(maxLatency / 1000000)}`));
-
     const bucketData = {
       testResultId,
       bucketNumber,
