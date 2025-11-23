@@ -949,68 +949,26 @@ async function ensureVegeta(): Promise<void> {
       } else {
         // Unix installation - use user bin directory to avoid sudo password prompt
         const userBinDir = path.join(process.env.HOME || '/tmp', '.local', 'bin');
-        const lockFile = path.join(userBinDir, '.vegeta-install.lock');
         
         console.log(chalk.gray(`  📌 Unix installation: userBinDir=${userBinDir}`));
-        console.log(chalk.gray(`  📌 Lock file: ${lockFile}`));
         console.log(chalk.gray(`  📌 Process ID: ${process.pid}`));
           
-          // Wait for any other process to finish installing
-          let waitAttempts = 0;
-          const lockWaitStart = Date.now();
-          while (await fs.access(lockFile).then(() => true).catch(() => false)) {
-            if (waitAttempts % 5 === 0) {
-              console.log(chalk.gray(`  📌 Waiting for lock file... (attempt ${waitAttempts + 1}, ${Date.now() - lockWaitStart}ms)`));
-            }
-            if (waitAttempts > 30) {
-              throw new Error(`Timeout waiting for vegeta installation lock after ${Date.now() - lockWaitStart}ms`);
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
-            waitAttempts++;
-          }
+          const mkdirStart = Date.now();
+          await execa('mkdir', ['-p', userBinDir]);
+          console.log(chalk.gray(`  📌 userBinDir created/exists (${Date.now() - mkdirStart}ms)`));
           
-          if (waitAttempts > 0) {
-            console.log(chalk.gray(`  📌 Lock file released after ${waitAttempts} attempts (${Date.now() - lockWaitStart}ms)`));
-          }
-          
-          // Create lock file
-          const lockCreateStart = Date.now();
+          // Check if vegeta already installed
+          const checkStart = Date.now();
           try {
-            await fs.writeFile(lockFile, `${Date.now()}-${process.pid}`);
-            console.log(chalk.gray(`  📌 Lock file created (${Date.now() - lockCreateStart}ms)`));
-          } catch (e) {
-            // Lock file already exists from another process, wait a bit more
-            console.log(chalk.gray(`  📌 Lock file creation failed, waiting for other process...`));
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-          
-          try {
-            const mkdirStart = Date.now();
-            await execa('mkdir', ['-p', userBinDir]);
-            console.log(chalk.gray(`  📌 userBinDir created/exists (${Date.now() - mkdirStart}ms)`));
-            
-            // Check if vegeta already installed (another process might have done it)
-            const checkStart = Date.now();
-            try {
-              await fs.access(path.join(userBinDir, 'vegeta'));
-              console.log(chalk.green(`✅ Vegeta already installed to ${userBinDir} (checked in ${Date.now() - checkStart}ms)`));
-            } catch {
-              // Not installed yet, do it now
-              const cpStart = Date.now();
-              await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
-              await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
-              const cpDuration = Date.now() - cpStart;
-              console.log(chalk.green(`✅ Vegeta installed to ${userBinDir} (took ${cpDuration}ms)`));
-            }
-          } finally {
-            // Remove lock file
-            try {
-              await fs.unlink(lockFile);
-              console.log(chalk.gray(`  📌 Lock file removed`));
-            } catch (e) {
-              // Ignore
-              console.log(chalk.gray(`  📌 Lock file removal failed (this is ok)`));
-            }
+            await fs.access(path.join(userBinDir, 'vegeta'));
+            console.log(chalk.green(`✅ Vegeta already installed to ${userBinDir} (checked in ${Date.now() - checkStart}ms)`));
+          } catch {
+            // Not installed yet, do it now
+            const cpStart = Date.now();
+            await execa('cp', [vegetaBinary, `${userBinDir}/vegeta`]);
+            await execa('chmod', ['+x', `${userBinDir}/vegeta`]);
+            const cpDuration = Date.now() - cpStart;
+            console.log(chalk.green(`✅ Vegeta installed to ${userBinDir} (took ${cpDuration}ms)`));
           }
           
         process.env.PATH = `${userBinDir}:${process.env.PATH}`;
